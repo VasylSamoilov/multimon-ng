@@ -283,11 +283,11 @@ static void output_sound(unsigned int sample_rate, const char *ifname)
 		perror("ioctl: SNDCTL_DSP_SPEED");
 		exit (10);
 	}
-        if ((10*abs(sndparam-sample_rate)) > sample_rate) {
+        if ((10*(unsigned)abs((int)((unsigned)sndparam-sample_rate))) > sample_rate) {
 		perror("ioctl: SNDCTL_DSP_SPEED");
 		exit (10);
 	}
-        if (sndparam != sample_rate) {
+        if ((unsigned)sndparam != sample_rate) {
                 fprintf(stderr, "Warning: Sampling rate is %u, "
                         "requested %u\n", sndparam, sample_rate);
         }

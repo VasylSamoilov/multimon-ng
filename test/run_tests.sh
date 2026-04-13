@@ -73,6 +73,37 @@ run_test "POCSAG2400" "POCSAG2400" "flac" "$SAMPLES_DIR/POCSAG_sample_-_2400_bps
     "POCSAG2400: Address: 1022869  Function: 1  Alpha:   +++TIME=0008300324" \
     || FAILED=1
 
+# FLEX_NEXT sample: real-world 1600/2FSK P2000 proef-alarm (Netherlands)
+# Tests: 1600/2FSK decode, fragment reassembly (F→C continuation),
+#        instruction messages (INS), group/tagged messages (TG),
+#        K checksum, signature validation — all PII-free
+run_test "FLEX_NEXT 1600/2FSK P2000 proef-alarm" "FLEX_NEXT" "flac" "$SAMPLES_DIR/FLEX_1600_2fsk_P2000_proef_alarm.flac" \
+    "FLEX_NEXT|1600/2|14.116.A|0001120103|SS|5|ALN|3.0.K.N0.R0|test" \
+    "FLEX_NEXT|1600/2|00.012.A|0001180000|SS|5|ALN|3.0.K.N0.R0|TESTOPROEP MOB" \
+    "FLEX_NEXT|1600/2|00.012.A|0001400521|SS|5|ALN|3.0.K.N0.R0|Test: Proefalarm Ochtend Brandweer Veiligheidsregio Rotterdam Rijnmond." \
+    "FLEX_NEXT|1600/2|00.013.A|0001400141|SS|5|ALN|0.0.C.N0.R0|Test: Proefalarm Ochtend Brandweer Veiligheidsregio Rotterdam Rijnmond." \
+    "FLEX_NEXT|1600/2|00.039.A|0001420033|SS|1|INS|i=0 frame=40 group=4" \
+    "FLEX_NEXT|1600/2|00.040.A|0002029572 0001420033 0001420999|TG|5|ALN|3.0.K.N0.R0|A2 (DIA: ja) AMBU 17133" \
+    "FLEX_NEXT|1600/2|00.038.A|0001123201|SS|5|ALN|3.0.K.N0.R0|B2 Eindhoven Rit: 105012" \
+    || FAILED=1
+
+# FLEX_NEXT sample: real-world 3200/4FSK pager traffic (NYC, 929.6125 MHz)
+# Tests: 4-phase decode (A/B/C/D), long addresses, alpha/numeric/short message,
+#        fragment reassembly, maildrop flag, K checksum, signature validation
+# NOTE: expectations match only PII-safe fields (capcodes, frame/phase, types)
+run_test "FLEX_NEXT 3200/4FSK sample" "FLEX_NEXT" "flac" "$SAMPLES_DIR/FLEX_3200_4fsk_sample.flac" \
+    "FLEX_NEXT|3200/4|07.044.C|0006715628|LS|5|ALN|3.0.K.N0.R0|Job For 9:03PM" \
+    "FLEX_NEXT|3200/4|07.046.C|0006846776|LS|5|ALN|3.0.K.N0.R0|No Jobs From Borough" \
+    "FLEX_NEXT|3200/4|07.042.A|0006568749|LS|2|SMSG|49312" \
+    "FLEX_NEXT|3200/4|07.044.D|0004709809|LS|2|SMSG|4185" \
+    "FLEX_NEXT|3200/4|07.044.A|0000225027|SS|3|NUM|3.1.F.N12.R0|5076" \
+    "FLEX_NEXT|3200/4|07.053.C|0005613441|LS|5|ALN|3.0.K.N0.R0|note-only: Northampton Generator Normal" \
+    "FLEX_NEXT|3200/4|07.052.B|0000995971|SS|2|SMSG|S=4 N=2 R=0" \
+    "FLEX_NEXT|3200/4|07.042.B|0004020573|LS|5|ALN" \
+    "FLEX_NEXT|3200/4|07.042.D|0002936688|LS|5|ALN" \
+    "FLEX_NEXT|3200/4|07.043.B|0006682761|LS|5|ALN" \
+    || FAILED=1
+
 # =============================================================================
 # BCH reference tests (pre-generated files for regression testing)
 # =============================================================================
@@ -157,7 +188,7 @@ if [ $GEN_NG_AVAILABLE -eq 1 ]; then
     run_gen_decode_expect_fail "FLEX 3-bit error (uncorrectable)" \
         '-f "Error3" -F 22222 -e 3' "FLEX" || FAILED=1
     
-    run_gen_decode_test "FLEX_NEXT decoder" \
+    run_gen_decode_test "FLEX_NEXT decoder (gen-ng)" \
         '-f "FLEX_NEXT test" -F 777777' "FLEX_NEXT" "0000777777" "FLEX_NEXT test" || FAILED=1
     
     echo
