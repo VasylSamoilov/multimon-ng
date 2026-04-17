@@ -28,7 +28,6 @@
  *   - FIW: roaming, repeat, traffic, num_tx (1-4), td_collapse fields
  *   - BIW parsing: SSID1, Date, Time, SysInfo (timezone/DST/extended seconds), SSID2
  *   - BIW101 system message vector decode at end of VF (Section 3.9.2 method a/b)
- *   - Subframe support: num_tx > 1 splits 88-word frame into N independent subframes
  *   - S2 C/inv.C detection with symbol buffer and replay for boundary correction
  *   - Phase mapping: bit_b to PhaseC at 1600 baud (A3), PhaseB at 3200 baud (A4)
  *   - Address type classification: S/L/N/T/O/I/R with special address handling
@@ -296,7 +295,7 @@ struct Flex_Decode {
   int                         long_address;
   int64_t                     capcode;
   char                        addr_type;     // S=short, L=long, N=network, T=temporary, O=operator, I=info, R=reserved
-  char                        phase;         // A/B/C/D — set by decode_phase_subframe
+  char                        phase;         // A/B/C/D - set by decode_phase
   int                         is_group;      // 1 if temporary group address
   int                         is_priority;   // 1 if in priority address range
   const char                 *sec_subtype;   // SEC sub-type string (NULL if not SEC)
@@ -331,7 +330,7 @@ struct Flex_Fragment {
   uint32_t                    sig_sum;       // accumulated signature sum across fragments
   uint32_t                    rx_sig;        // received signature from initial fragment
   int                         sig_valid;     // 1 if all fragment words were clean
-  int                         expected_f;    // next expected F value (mod 3 sequence: 11→00→01→10→00...)
+  int                         expected_f;    // next expected F value (mod 3 sequence: 11->00->01->10->00...)
   int                         frag_index;    // fragment counter (0=initial, 1=first cont, ...)
   int                         f_mismatch;    // 1 if any F sequence mismatch detected (missing fragment)
 };
@@ -412,7 +411,7 @@ struct Flex_OTA_Time {
   unsigned int frame_tz;   // cycle*128+frame when tz was received (0-1919)
 };
 
-/* Frame space: 15 cycles × 128 frames = 1920 frames per full hour cycle.
+/* Frame space: 15 cycles x 128 frames = 1920 frames per full hour cycle.
  * Wrap-aware forward distance between two frame positions. */
 #define FLEX_FRAME_SPACE 1920
 /* Expire flextime components after one full cycle + 5 frames margin.
@@ -469,7 +468,7 @@ static char addr_type_char(uint32_t aiw, int is_long) {
 }
 
 // JSON output helper: emit a complete JSON message object.
-// Called from decode_phase_subframe after message parsing is complete.
+// Called from decode_phase after message parsing is complete.
 // All fields are optional (pass NULL/negative to omit).
 static void flex_next_json_emit(struct Flex_Next *flex, char phase,
                                 int64_t capcode, char addr_type,
@@ -568,7 +567,7 @@ static void flex_next_json_emit(struct Flex_Next *flex, char phase,
     unsigned int cur_frame = flex->FIW.cycleno * 128 + flex->FIW.frameno;
     // Expire stale components before emitting
     flextime_expire(&flex->ota_time, cur_frame);
-    // Re-check after expiry — might have nothing left
+    // Re-check after expiry - might have nothing left
     if (flex->ota_time.has_date || flex->ota_time.has_time || flex->ota_time.has_tz) {
     cJSON *ft = cJSON_CreateObject();
 
@@ -1130,7 +1129,7 @@ static void frag_expire(struct Flex_Next * flex, unsigned int current_frame) {
 // The cache entry index is written to *out_slot on return 2 so the
 // caller can access the merged words.
 //
-// word_src/err_src point into the subframe's phaseptr/bch_err arrays.
+// word_src/err_src point into the phase's phaseptr/bch_err arrays.
 // word_off is the index of the first word to store (header word).
 // n_words is the total number of words (1 header + body_len body words).
 static int dedup_check_words(struct Flex_Next * flex, int64_t capcode, int type,
@@ -1310,7 +1309,7 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
         // Signature S (Section 3.10.1.3): 7-bit, 1's complement of binary sum
         // of all 7-bit character slots (excluding signature itself).
         // ETX (0x03) fill characters are excluded from the sum per spec.
-        // (Standard Fragmentation mode — Enhanced Fragmentation also
+        // (Standard Fragmentation mode - Enhanced Fragmentation also
         // excludes NUL, but that's not implemented.)
         uint32_t sig_sum = 0;
         uint32_t rx_sig = 0;
@@ -1394,7 +1393,7 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
                            flex->Decode.capcode, flex->FragStore.slots[slot].expected_f, frag);
                 flex->FragStore.slots[slot].f_mismatch = 1;
               }
-              // Advance expected_f: mod 3 cycle (0→1→2→0→1→2...)
+              // Advance expected_f: mod 3 cycle (0->1->2->0->1->2...)
               flex->FragStore.slots[slot].expected_f = (frag + 1) % 3;
               flex->FragStore.slots[slot].frag_index++;
             }
@@ -1555,7 +1554,7 @@ group_output:
         } 
 }
 
-static void parse_numeric(struct Flex_Next * flex, unsigned int * phaseptr, int * bch_err, int j, int sf_words, int frag, int cont, int msg_n, int msg_r, int msg_m, int dedup_flag) {
+static void parse_numeric(struct Flex_Next * flex, unsigned int * phaseptr, int * bch_err, int j, int frag, int cont, int msg_n, int msg_r, int msg_m, int dedup_flag) {
   if (flex==NULL) return;
   // BCD table per ARIB STD-43A Section 3.10.1.1:
   //   0-9 = digits, A = spare('.'), B = urgency('U'),
@@ -1574,9 +1573,9 @@ static void parse_numeric(struct Flex_Next * flex, unsigned int * phaseptr, int 
   w1 = w1 & 0x7f;
   w2 = (w2 & 0x07) + w1;  // w2 = start + word_count - 1
 
-  // Validate w1 and w2 against subframe bounds
-  if (w1 >= sf_words || w2 >= sf_words) {
-    verbprintf(3, "FLEX_NEXT: Numeric w1=%d w2=%d out of subframe bounds (%d), skipping\n", w1, w2, sf_words);
+  // Validate w1 and w2 against frame bounds
+  if (w1 >= PHASE_WORDS || w2 >= PHASE_WORDS) {
+    verbprintf(3, "FLEX_NEXT: Numeric w1=%d w2=%d out of frame bounds (%d), skipping\n", w1, w2, PHASE_WORDS);
     return;
   }
 
@@ -1588,12 +1587,12 @@ static void parse_numeric(struct Flex_Next * flex, unsigned int * phaseptr, int 
   int dw;
   int dw_bad = 0;
   if(!flex->Decode.long_address) {
-    dw_bad = (w1 < sf_words && bch_err[w1]);
+    dw_bad = (w1 < PHASE_WORDS && bch_err[w1]);
     dw = phaseptr[w1];
     w1++;
     w2++;
   } else {
-    dw_bad = ((j+1) < sf_words && bch_err[j+1]);
+    dw_bad = ((j+1) < PHASE_WORDS && bch_err[j+1]);
     dw = phaseptr[j+1];
   }
 
@@ -1623,7 +1622,7 @@ static void parse_numeric(struct Flex_Next * flex, unsigned int * phaseptr, int 
     int body0 = flex->Decode.long_address ? (j + 1) : (w1 - 1);
 
     // Include body0 with K5K4 zeroed
-    if (body0 >= 0 && body0 < sf_words && !bch_err[body0]) {
+    if (body0 >= 0 && body0 < PHASE_WORDS && !bch_err[body0]) {
       uint32_t dw = phaseptr[body0] & ~0x03u;  // zero K5K4 (bits 0-1)
       k_sum += dw & 0xFFu;
       k_sum += (dw >> 8) & 0xFFu;
@@ -1632,21 +1631,14 @@ static void parse_numeric(struct Flex_Next * flex, unsigned int * phaseptr, int 
       k_ok = 0;
     }
 
-    // Include remaining body words (w1 to w2-1 for short, w1 to w2 for long)
-    if (!flex->Decode.long_address) {
-      for (ki = w1; ki < w2 && ki < sf_words; ki++) {
-        if (bch_err[ki]) { k_ok = 0; continue; }
-        k_sum += phaseptr[ki] & 0xFFu;
-        k_sum += (phaseptr[ki] >> 8) & 0xFFu;
-        k_sum += (phaseptr[ki] >> 16) & 0x1Fu;
-      }
-    } else {
-      for (ki = w1; ki <= w2 && ki < sf_words; ki++) {
-        if (bch_err[ki]) { k_ok = 0; continue; }
-        k_sum += phaseptr[ki] & 0xFFu;
-        k_sum += (phaseptr[ki] >> 8) & 0xFFu;
-        k_sum += (phaseptr[ki] >> 16) & 0x1Fu;
-      }
+    // Include remaining body words (w1 to w2-1).
+    // For short addr, body0 is at w1-1 (already summed above), data at w1..w2-1.
+    // For long addr, body0 is at j+1 (Vy, already summed above), MF at w1..w2-1.
+    for (ki = w1; ki < w2 && ki < PHASE_WORDS; ki++) {
+      if (bch_err[ki]) { k_ok = 0; continue; }
+      k_sum += phaseptr[ki] & 0xFFu;
+      k_sum += (phaseptr[ki] >> 8) & 0xFFu;
+      k_sum += (phaseptr[ki] >> 16) & 0x1Fu;
     }
 
     if (k_ok && !dw_bad) {
@@ -1715,7 +1707,7 @@ static void parse_numeric(struct Flex_Next * flex, unsigned int * phaseptr, int 
     // Load next word, check BCH status.
     // Guard: only load when another iteration follows (i+1 <= w2)
     // to avoid reading one word past the message.
-    if (i + 1 <= w2 && i < sf_words) {
+    if (i + 1 <= w2 && i < PHASE_WORDS) {
       dw_bad = bch_err[i];
       dw = phaseptr[i];
     }
@@ -2007,7 +1999,7 @@ static void parse_binary(struct Flex_Next * flex, unsigned int * phaseptr, int *
     }
 
     // Rule (2): partial fill in last word.  Scan backwards from
-    // bit 20 — consecutive identical bits from the top are fill.
+    // bit 20 - consecutive identical bits from the top are fill.
     // The first differing bit marks the end of real data.
     if (last_w != (unsigned int)-1 && last_w < PHASE_WORDS && !bch_err[last_w]) {
       unsigned int lw = phaseptr[last_w];
@@ -2188,10 +2180,6 @@ static void parse_binary(struct Flex_Next * flex, unsigned int * phaseptr, int *
 }
 
 
-static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
-                                  uint32_t *phaseptr, int *bch_err,
-                                  int sf_words, int slot);
-
 static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
   if (flex==NULL) return;
   verbprintf(3, "FLEX_NEXT: Decoding phase %c\n", PhaseNo);
@@ -2233,64 +2221,13 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
   }
 
   // Multiple transmission (Section 3.4.2):
-  // When num_tx > 1, the 88-word frame is divided into N subframes.
-  // Each subframe slot carries a DIFFERENT message that was originally
-  // scheduled for a different frame.  The slot position (0..N-1) is
-  // the retransmission copy number.  Slot 0 = first transmission,
-  // slot 1 = retransmission of content from an earlier frame, etc.
-  //
-  // Subframe word counts: 2x=44, 3x=29 (word 87 spare), 4x=22.
-  // Each subframe has its own BIW, address field, vector field, and
-  // message field - it is decoded independently as a mini-frame.
-  //
-  // TODO: cross-frame word-level combining of the same content
-  // received in different slots across multiple frames.
+  // Subframe splitting ignored - always decode full 88-word frame.
   int num_tx = (int)flex->FIW.num_tx;
-  int num_slots = (num_tx > 1) ? num_tx : 1;
-  int sf_words = PHASE_WORDS;
-  if (num_tx == 2) sf_words = 44;
-  else if (num_tx == 3) sf_words = 29;
-  else if (num_tx == 4) sf_words = 22;
+  int sf_size = (num_tx == 2) ? 44 : (num_tx == 3) ? 29 : (num_tx == 4) ? 22 : 88;
+  verbprintf(num_tx > 1 ? 0 : 3, "FLEX_NEXT: num_tx=%d sf_size=%d, decoding full frame (subframe retransmission ignored)\n", num_tx, sf_size);
 
-  for (int slot = 0; slot < num_slots; slot++) {
-    int sf_offset = slot * sf_words;
-    if (sf_offset + sf_words > PHASE_WORDS) break;
-
-    // Decode this subframe starting at sf_offset
-    decode_phase_subframe(flex, PhaseNo, phaseptr + sf_offset,
-                          bch_err + sf_offset, sf_words, slot);
-  }
-}
-
-
-// Decode a single subframe (or the full 88-word frame when num_tx==1).
-//
-// Multiple transmission (Section 3.4.2):
-// When num_tx > 1, the 88-word frame is split into N equal subframes.
-// Each slot carries content for a DIFFERENT original frame:
-//   slot 0 = first transmission of this frame's content
-//   slot 1 = 2nd transmission (retransmission) of content from an earlier frame
-//   slot 2 = 3rd transmission, etc.
-//
-// The same content appears at slot 0 in frame F, slot 1 in frame
-// F+interval, slot 2 in F+2*interval, etc.  So a pager that missed
-// the first transmission can pick up the retransmission in a later
-// frame at a higher slot position.
-//
-// For example, with 4x transmission and interval=4:
-//   Frame F:   slot 0 = msg_A (1st tx), slot 1 = msg_B (2nd tx),
-//              slot 2 = msg_C (3rd tx), slot 3 = msg_D (4th tx)
-//   Frame F+4: slot 0 = msg_E (1st tx), slot 1 = msg_A (2nd tx), ...
-//
-// Each subframe is self-contained with its own BIW, AF, VF, MF.
-// We decode each slot independently.  Cross-frame combining of
-// multiple copies of the same content is a future enhancement.
-static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
-                                  uint32_t *phaseptr, int *bch_err,
-                                  int sf_words, int slot) {
-
-  // Block information word is the first data word in subframe
-  flex->biw_sysmsg_a_type = -1;  // reset per subframe
+  // Block information word is the first data word
+  flex->biw_sysmsg_a_type = -1;
   flex->Decode.phase = PhaseNo;  // store for parse functions to access
   flex->Decode.sec_subtype = NULL;
   flex->Decode.opr_category = NULL;
@@ -2298,7 +2235,7 @@ static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
 
   // If BIW itself is uncorrectable, we cannot parse this phase
   if (bch_err[0]) {
-    verbprintf(3, "FLEX_NEXT: BIW uncorrectable (phase %c slot %d), skipping\n", PhaseNo, slot);
+    verbprintf(3, "FLEX_NEXT: BIW uncorrectable (phase %c), skipping\n", PhaseNo);
     return;
   }
 
@@ -2331,7 +2268,7 @@ static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
   // BIW type is identified by bits 6-4 of each extra BIW word.
   {
     unsigned int bw;
-    for (bw = 1; bw < aoffset && bw < (unsigned)sf_words; bw++) {
+    for (bw = 1; bw < aoffset && bw < (unsigned)PHASE_WORDS; bw++) {
       unsigned int bword;
       unsigned int btype;
 
@@ -2383,7 +2320,7 @@ static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
           unsigned int year = year_raw + 1994;
           verbprintf(2, "FLEX_NEXT: BIW DATE: %04u-%02u-%02u (phase %c)\n", year, mon, day, PhaseNo);
           // Store as last known good OTA date
-          // Validate fields — month 0 or day 0 indicates corrupt data
+          // Validate fields - month 0 or day 0 indicates corrupt data
           if (mon >= 1 && mon <= 12 && day >= 1 && day <= 31) {
             flex->ota_time.year = year;
             flex->ota_time.month = mon;
@@ -2392,6 +2329,7 @@ static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
             flex->ota_time.frame_date = flex->FIW.cycleno * 128 + flex->FIW.frameno;
           } else {
             verbprintf(3, "FLEX_NEXT: BIW DATE out of range: year=%u mon=%u day=%u, discarding\n", year, mon, day);
+            break;
           }
           if (json_mode) {
             cJSON *json = cJSON_CreateObject();
@@ -2428,7 +2366,7 @@ static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
           unsigned int sec = (bword >> 18) & 0x7;
           verbprintf(2, "FLEX_NEXT: BIW TIME: %02u:%02u:%04.1f (phase %c)\n", hour, min, sec * 7.5, PhaseNo);
           // Store as last known good OTA time (coarse, 7.5s resolution)
-          // Validate fields before storing — corrupted BCH words can produce
+          // Validate fields before storing - corrupted BCH words can produce
           // out-of-range values (e.g. hour=24, min=63)
           if (hour <= 23 && min <= 59 && sec <= 7) {
             flex->ota_time.hour = hour;
@@ -2438,6 +2376,7 @@ static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
             flex->ota_time.frame_time = flex->FIW.cycleno * 128 + flex->FIW.frameno;
           } else {
             verbprintf(3, "FLEX_NEXT: BIW TIME out of range: hour=%u min=%u sec=%u, discarding\n", hour, min, sec);
+            break;
           }
           if (json_mode) {
             cJSON *json = cJSON_CreateObject();
@@ -2597,8 +2536,8 @@ static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
   int n_valid_vecs;
   {
     int max_vec = (int)(voffset - aoffset);
-    if (max_vec > (int)((unsigned)sf_words - voffset))
-      max_vec = (int)((unsigned)sf_words - voffset);
+    if (max_vec > (int)((unsigned)PHASE_WORDS - voffset))
+      max_vec = (int)((unsigned)PHASE_WORDS - voffset);
     int last_valid = -1;
     for (int vi = 0; vi < max_vec; vi++) {
       int wi = (int)voffset + vi;
@@ -2611,7 +2550,7 @@ static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
       // Check vector type first: Short Instruction vectors (V=001)
       // use a different field layout where bits 7-20 carry instruction
       // data, not message word pointers.  The 4-bit nibble checksum
-      // (Section 3.5.1) does NOT apply to instruction vectors — the
+      // (Section 3.5.1) does NOT apply to instruction vectors - the
       // checksum field (bits 0-3) is part of the instruction encoding.
       // Always treat instruction vectors as valid.
       int vtype = (vw >> 4) & 0x7;
@@ -2797,7 +2736,7 @@ static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
     // The pre-scan counted n_valid_vecs: the number of vector slots that
     // pass the 4-bit checksum.  Once vec_used reaches that count, all
     // remaining addresses are tone-only - no vector consumed.
-    if ((int)vec_used >= n_valid_vecs || j >= (unsigned)sf_words) {
+    if ((int)vec_used >= n_valid_vecs || j >= (unsigned)PHASE_WORDS) {
       if (flex->Decode.long_address) {
         // Long addresses cannot be tone-only - skip as invalid
         verbprintf(3, "FLEX_NEXT: Long address past valid vectors, skipping cap %" PRId64 "\n", flex->Decode.capcode);
@@ -2967,12 +2906,12 @@ static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
       if (len >= 1) {
         // Header word is counted in n, so content is len-1 words.
         // This applies to ALL short address messages including group
-        // messages — the header word layout is the same regardless
+        // messages - the header word layout is the same regardless
         // of whether the address is a temporary group delivery slot.
         len--;
       }
     }
-    if (hdr >= (unsigned)sf_words) {
+    if (hdr >= (unsigned)PHASE_WORDS) {
       verbprintf(3, "FLEX_NEXT: Invalid VIW\n");
       continue;
     }
@@ -3016,7 +2955,7 @@ static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
       msg_n = (int) (phaseptr[hdr] >> 15) & 0x3F;
       // R and M are in hdr2 (initial fragment only)
       int is_initial_hex = (frag == 0x03);
-      if (is_initial_hex && mw1 < (unsigned)sf_words && !bch_err[mw1]) {
+      if (is_initial_hex && mw1 < (unsigned)PHASE_WORDS && !bch_err[mw1]) {
         msg_r = (int) (phaseptr[mw1] >> 0) & 0x1;
         msg_m = (int) (phaseptr[mw1] >> 1) & 0x1;
       } else {
@@ -3035,7 +2974,7 @@ static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
     verbprintf(3, "FLEX_NEXT: VIW %u: type:%d mw1:%u len:%u frag:%d N:%d R:%d M:%d\n", j, flex->Decode.type, mw1, len, frag, msg_n, is_initial ? msg_r : -1, is_initial ? msg_m : -1);
 
     // mw1 == 0 is invalid (word 0 is always BIW), and must be within the frame.
-    // The reference decoder only checks mw1 <= 87 — the vector b field can
+    // The reference decoder only checks mw1 <= 87 - the vector b field can
     // legitimately point anywhere in the frame including the vector field
     // (e.g. long addresses where Vy holds body[0]).
     // For short message (type 2) and numeric types, len can be 0 (all data in vector).
@@ -3050,13 +2989,13 @@ static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
       verbprintf(3, "FLEX_NEXT: Invalid VIW\n");
       continue;
     }
-    if (mw1 >= (unsigned)sf_words) {
+    if (mw1 >= (unsigned)PHASE_WORDS) {
       verbprintf(3, "FLEX_NEXT: Invalid VIW\n");
       continue;
     }
     // mw1 + len == 89 was observed, but still contained valid page, so truncate
-    if ((mw1 + len) > (unsigned)sf_words){
-      len = (unsigned)sf_words - mw1;
+    if ((mw1 + len) > (unsigned)PHASE_WORDS){
+      len = (unsigned)PHASE_WORDS - mw1;
     }
 
     // Log message body BCH errors (damaged words will show as '?' in output)
@@ -3064,7 +3003,7 @@ static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
       unsigned int body_errors = 0;
       unsigned int k;
       for (k = 0; k < len; k++) {
-        if ((mw1 + k) < (unsigned)sf_words && bch_err[mw1 + k])
+        if ((mw1 + k) < (unsigned)PHASE_WORDS && bch_err[mw1 + k])
           body_errors++;
       }
       if (body_errors > 0) {
@@ -3078,11 +3017,11 @@ static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
     // 0=new, 1=exact duplicate (DUP), 2=improved retransmission (DUP+)
     int dedup_flag = 0;
     // Pointer/error arrays used for decode. Normally point at the
-    // subframe, but may be redirected to merged dedup cache words.
+    // phase data, but may be redirected to merged dedup cache words.
     uint32_t *decode_words = phaseptr;
     int      *decode_errs  = bch_err;
     // Temporary arrays for decoding from dedup cache (merged words).
-    // Sized to sf_words so all existing index math works unchanged.
+    // Sized to PHASE_WORDS so all existing index math works unchanged.
     uint32_t  merged_words[PHASE_WORDS];
     int       merged_errs[PHASE_WORDS];
 
@@ -3092,7 +3031,7 @@ static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
       unsigned int n_msg_words = 1 + len;
       // Build a packed array for the dedup check. The cache stores
       // words packed as [hdr, body0, body1, ...] regardless of their
-      // original positions in the subframe.
+      // original positions in the frame.
       uint32_t packed_words[FLEX_DEDUP_MAX_WORDS];
       int      packed_errs[FLEX_DEDUP_MAX_WORDS];
       if (n_msg_words <= FLEX_DEDUP_MAX_WORDS) {
@@ -3117,8 +3056,8 @@ static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
         if (dedup_rc == 2 && dedup_slot >= 0) {
           // Improved retransmission - decode from merged cache words.
           dedup_flag = 2;
-          memcpy(merged_words, phaseptr, (unsigned)sf_words * sizeof(uint32_t));
-          memcpy(merged_errs, bch_err, (unsigned)sf_words * sizeof(int));
+          memcpy(merged_words, phaseptr, (unsigned)PHASE_WORDS * sizeof(uint32_t));
+          memcpy(merged_errs, bch_err, (unsigned)PHASE_WORDS * sizeof(int));
           struct Flex_DedupEntry *de = &flex->DedupStore.entries[dedup_slot];
           merged_words[hdr] = de->words[0];
           merged_errs[hdr]  = de->errs[0];
@@ -3166,7 +3105,7 @@ static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
     // message word.  Uses Secure (V=000) vector type.
     if (flex->Decode.addr_type == 'N' &&
         flex->Decode.type == FLEX_PAGETYPE_SECURE &&
-        mw1 < (unsigned)sf_words && !decode_errs[mw1]) {
+        mw1 < (unsigned)PHASE_WORDS && !decode_errs[mw1]) {
       uint32_t net_mw = decode_words[mw1];
       unsigned int area_id = net_mw & 0x3F;
       unsigned int zones   = (net_mw >> 6) & 0x1F;
@@ -3258,7 +3197,7 @@ static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
       //   t=11: reserved
       // Registration Acknowledgment: t=00 with opcode '=' (0x3D) in 2nd word.
       int sec_t = -1;
-      if (hdr < (unsigned)sf_words && !decode_errs[hdr]) {
+      if (hdr < (unsigned)PHASE_WORDS && !decode_errs[hdr]) {
         sec_t = (decode_words[hdr] >> 19) & 0x3;
       }
       if (sec_t == 0) {
@@ -3281,15 +3220,15 @@ static void decode_phase_subframe(struct Flex_Next * flex, char PhaseNo,
     }
     case FLEX_PAGETYPE_STANDARD_NUMERIC:
       if (!json_mode) verbprintf(0, "NUM|");
-      parse_numeric(flex, decode_words, decode_errs, j, sf_words, frag, cont, msg_n, msg_r, msg_m, dedup_flag);
+      parse_numeric(flex, decode_words, decode_errs, j, frag, cont, msg_n, msg_r, msg_m, dedup_flag);
       break;
     case FLEX_PAGETYPE_SPECIAL_NUMERIC:
       if (!json_mode) verbprintf(0, "SNUM|");
-      parse_numeric(flex, decode_words, decode_errs, j, sf_words, frag, cont, msg_n, msg_r, msg_m, dedup_flag);
+      parse_numeric(flex, decode_words, decode_errs, j, frag, cont, msg_n, msg_r, msg_m, dedup_flag);
       break;
     case FLEX_PAGETYPE_NUMBERED_NUMERIC:
       if (!json_mode) verbprintf(0, "NNUM|");
-      parse_numeric(flex, decode_words, decode_errs, j, sf_words, frag, cont, msg_n, msg_r, msg_m, dedup_flag);
+      parse_numeric(flex, decode_words, decode_errs, j, frag, cont, msg_n, msg_r, msg_m, dedup_flag);
       break;
     case FLEX_PAGETYPE_SHORT_MESSAGE:
       parse_short_message(flex, decode_words, decode_errs, j);
@@ -3323,12 +3262,12 @@ page_done:
   if (flex->biw_sysmsg_a_type >= 0 && flex->biw_sysmsg_a_type <= 3) {
     int sv_idx = (int)voffset + n_valid_vecs - 1;
     if (sv_idx > (int)voffset + (int)vec_used - 1 &&
-        sv_idx < sf_words && !bch_err[sv_idx]) {
+        sv_idx < PHASE_WORDS && !bch_err[sv_idx]) {
       uint32_t sv = phaseptr[sv_idx];
       int sv_type = (sv >> 4) & 0x7;
       int sv_mw1 = (sv >> 7) & 0x7F;
       int sv_len = (sv >> 14) & 0x7F;
-      if (sv_len > 0 && sv_mw1 < sf_words) {
+      if (sv_len > 0 && sv_mw1 < PHASE_WORDS) {
         if (!json_mode) {
           verbprintf(0, "FLEX_NEXT|%i/%i|%02i.%03i.%c|SysMsg_A%d||%1d|SYS|",
                      flex->Sync.baud, flex->Sync.levels,
