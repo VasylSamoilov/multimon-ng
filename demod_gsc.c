@@ -125,6 +125,11 @@ struct gsc_state {
     /* end-of-transmission detection */
     int no_transition;
 
+    /* preamble-during-DATA tracking (require 3 consecutive matches) */
+    int data_preamble_idx;
+    int data_preamble_inv;
+    int data_preamble_count;
+
     /* voice tracking */
     char voice_address[16]; /* 7-digit GSC address */
     int voice_function;
@@ -751,7 +756,7 @@ static int gsc_decode_batch(struct gsc_state *gsc, int force)
 
                 for (k = 0; k < 8; k++) {
                     if (ch[k] == 0x3E) {
-                        alpha_fill++; /* NULL fill character */
+                        alpha_fill++;
                         continue;
                     }
                     char c = alpha_table[ch[k] & 0x3F];
@@ -766,8 +771,9 @@ static int gsc_decode_batch(struct gsc_state *gsc, int force)
                 }
             }
 
-            /* Numeric unpack: 7 data words -> 12 four-bit nibbles */
-            {
+            /* Numeric unpack: only for the first GSC_MAX_NDB blocks.
+             * If we're past that, the message is definitively alpha. */
+            if (block_count < GSC_MAX_NDB) {
                 uint8_t nib[12];
                 nib[0] = d[0] & 0x0F;
                 nib[1] = ((d[0] >> 4) | (d[1] << 3)) & 0x0F;
@@ -783,7 +789,7 @@ static int gsc_decode_batch(struct gsc_state *gsc, int force)
                 nib[11] = (d[6] >> 2) & 0x0F;
 
                 for (k = 0; k < 12; k++) {
-                    if (numeric_nibble_count < 256)
+                    if (numeric_nibble_count < GSC_MAX_NDB * 12)
                         numeric_nibbles[numeric_nibble_count++] = nib[k];
                     if (nib[k] == 0x0A) {
                         numeric_fill++;
@@ -824,7 +830,15 @@ static int gsc_decode_batch(struct gsc_state *gsc, int force)
         alpha_msg[alpha_len] = '\0';
         numeric_msg[numeric_len] = '\0';
 
-        /* Content scoring.
+        /* If message exceeds MAX_NDB blocks, it's definitively alpha.
+         * Skip scoring/voting entirely. */
+        if (block_count > GSC_MAX_NDB) {
+            suffix = '5' + function;
+            verbprintf(0, "GSC: Address: %s%c  Function: %d  Alpha:   \"%s\"\n", addr_str, suffix, function + 1,
+                       esc_nl(alpha_msg));
+        } else {
+
+        /* Content scoring for short messages (1-2 blocks).
          * Alpha: letters/digits/space = +3, other printable = -2, control = -5.
          *        Fill chars (0x3E) add quadratic bonus.
          * Numeric: digits = +3, space/hyphen/asterisk = -2, stray U = -15.
@@ -917,7 +931,6 @@ static int gsc_decode_batch(struct gsc_state *gsc, int force)
         } else {
             is_numeric = (numeric_score > alpha_score);
         }
-        char suffix;
         if (is_numeric)
             suffix = '5' + function; /* numeric: suffix 5-8 */
         else
@@ -945,6 +958,7 @@ static int gsc_decode_batch(struct gsc_state *gsc, int force)
             suffix = (function == 0) ? '9' : '0';
             verbprintf(0, "GSC: Address: %s%c  Function: %d  Tone\n", addr_str, suffix, function + 1);
         }
+        } /* end of short-message scoring/voting */
     } else { /* not data */
         /* Tone or voice */
         if (detected_type == 1) {
@@ -1436,6 +1450,73 @@ static void gsc_rxbit(struct demod_state *s, uint8_t bit)
         gsc->no_transition++;
     else
         gsc->no_transition = 0;
+
+    /* Scan for new preamble during DATA (back-to-back transmissions).
+     * Requires GSC_PREAMBLE_LOCK consecutive matches to avoid
+     * false-triggering on data content. */
+    if (gsc->rx_bit_num > 856 && !gsc->batch_candidate) {
+        gsc->rx_shift[gsc->rx_shift_count % 46] = gsc->polarity_inverted ? !bit : bit;
+        gsc->rx_shift_count++;
+
+        if (gsc->rx_shift_count >= 46) {
+            unsigned int codeword = resolve_shift_register(gsc->rx_shift);
+            unsigned int try_cw;
+            int new_idx = -1;
+            int new_inv = 0;
+
+            gsc->rx_shift_count = 0;
+
+            try_cw = codeword;
+            if (bch_golay_correct(&try_cw) >= 0)
+                new_idx = match_preamble((unsigned short)try_cw);
+            if (new_idx < 0) {
+                try_cw = codeword ^ 0x7FFFFF;
+                if (bch_golay_correct(&try_cw) >= 0) {
+                    new_idx = match_preamble((unsigned short)try_cw);
+                    if (new_idx >= 0) new_inv = 1;
+                }
+            }
+
+            if (new_idx >= 0 && new_idx == gsc->data_preamble_idx)
+                gsc->data_preamble_count++;
+            else if (new_idx >= 0) {
+                gsc->data_preamble_idx = new_idx;
+                gsc->data_preamble_inv = new_inv;
+                gsc->data_preamble_count = 1;
+            } else {
+                gsc->data_preamble_count = 0;
+            }
+
+            if (gsc->data_preamble_count >= GSC_PREAMBLE_LOCK) {
+                int old_bits = gsc->rx_bit_num - gsc->data_preamble_count * 46;
+
+                if (old_bits >= (int)(GSC_COMMA_LEN + GSC_PREAMBLE_REPS * GSC_DUP_BITS + 121 + 121)) {
+                    int saved = gsc->rx_bit_num;
+                    gsc->rx_bit_num = old_bits;
+                    gsc_decode_batch(gsc, 1);
+                    gsc->rx_bit_num = saved;
+                }
+
+                gsc->confirm_index = gsc->data_preamble_idx;
+                gsc->confirm_count = gsc->data_preamble_count;
+                if (gsc->data_preamble_inv) {
+                    gsc->polarity_inverted = 0;
+                    gsc->batch_candidate = 1;
+                } else {
+                    gsc->polarity_inverted = 0;
+                    gsc->batch_candidate = 0;
+                }
+                memcpy(gsc->confirm_bits, gsc->rx_shift, 46);
+                gsc->confirm_bit_count = 0;
+                gsc->rx_shift_count = 0;
+                gsc->rx_bit_num = 0;
+                gsc->no_transition = 0;
+                gsc->data_preamble_count = 0;
+                gsc->state = GSC_PREAMBLE;
+                return;
+            }
+        }
+    }
 
     /* Minimum bits for a valid batch: preamble + start + address */
     int min_bits = GSC_COMMA_LEN + GSC_PREAMBLE_REPS * GSC_DUP_BITS + 121 + 121;
