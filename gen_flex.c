@@ -52,6 +52,17 @@
 
 /*---------------------------------------------------------------------------*/
 
+/* Encode 21-bit data into a 32-bit FLEX word with even parity (bit 31).
+ * Bits 0-20 = data, bits 21-30 = BCH parity, bit 31 = even parity over bits 0-30. */
+static uint32_t flex_encode_word(uint32_t data)
+{
+    uint32_t cw = bch_flex_encode(data & 0x1FFFFF);
+    /* Compute even parity over bits 0-30 and set bit 31 */
+    uint32_t p = 0, tmp = cw;
+    while (tmp) { p ^= 1; tmp &= tmp - 1; }
+    return cw | (p << 31);
+}
+
 /* Inject bit errors into a 31-bit codeword */
 static uint32_t inject_errors(uint32_t codeword, int num_errors, unsigned int *seed)
 {
@@ -121,7 +132,7 @@ static uint32_t build_fiw(int cycle, int frame)
     int checksum = (0xF - sum) & 0xF;
     fiw |= checksum;
     
-    return bch_flex_encode(fiw);
+    return flex_encode_word(fiw);
 }
 
 /* Build BIW (Block Information Word) - returns BCH-encoded 31-bit word */
@@ -137,7 +148,7 @@ static uint32_t build_biw(int voffset, int aoffset)
     biw |= (aoffset & 0x3) << 8;
     biw |= (voffset & 0x3F) << 10;
     
-    return bch_flex_encode(biw);
+    return flex_encode_word(biw);
 }
 
 /* Build address word - returns BCH-encoded 31-bit word */
@@ -147,14 +158,14 @@ static uint32_t build_address(uint32_t capcode)
      * The decoder does: capcode = aw1 - 0x8000
      * So we encode: aw1 = capcode + 0x8000
      */
-    return bch_flex_encode((capcode + 0x8000) & 0x1FFFFF);
+    return flex_encode_word((capcode + 0x8000) & 0x1FFFFF);
 }
 
 /* Build vector word - returns BCH-encoded 31-bit word */
 static uint32_t build_vector(int msg_type, int msg_start, int msg_len)
 {
     /* Vector format (21 data bits):
-     * Bits 3:0   = 4-bit checksum (Section 3.5.1)
+     * Bits 3:0   = 4-bit checksum
      * Bits 6:4   = message type V
      * Bits 13:7  = message word start (b)
      * Bits 20:14 = message length in words (n)
@@ -174,13 +185,13 @@ static uint32_t build_vector(int msg_type, int msg_start, int msg_len)
     uint32_t checksum = (0xF - (sum & 0xF)) & 0xF;
     vec |= checksum;
     
-    return bch_flex_encode(vec);
+    return flex_encode_word(vec);
 }
 
 /* Build message word - returns BCH-encoded 31-bit word */
 static uint32_t build_message_word(uint32_t data)
 {
-    return bch_flex_encode(data & 0x1FFFFF);
+    return flex_encode_word(data & 0x1FFFFF);
 }
 
 /* Encode a string to FLEX message words (7-bit ASCII)
@@ -250,9 +261,9 @@ void gen_init_flex(struct gen_params *p, struct gen_state *s)
      * Use alternating 0xAAAAAA/0x155555 patterns instead of all-1s */
     for (i = 0; i < FLEX_CODEWORDS_PER_PHASE; i++) {
         if (i % 2 == 0) {
-            codewords[i] = bch_flex_encode(0x0AAAAA);  /* 010101... pattern */
+            codewords[i] = flex_encode_word(0x0AAAAA);  /* 010101... pattern */
         } else {
-            codewords[i] = bch_flex_encode(0x155555);  /* 101010... pattern */
+            codewords[i] = flex_encode_word(0x155555);  /* 101010... pattern */
         }
     }
     
@@ -278,7 +289,7 @@ void gen_init_flex(struct gen_params *p, struct gen_state *s)
     codewords[1] = build_address(p->p.flex.capcode);
     codewords[2] = build_vector(FLEX_PAGETYPE_ALPHANUMERIC, msg_start, total_msg_words);
     
-    /* Message header word at msg_start (Section 3.10.1.3):
+    /* Message header word at msg_start:
      *   bits 0-9:   K (10-bit fragment checksum, computed last)
      *   bit  10:    C=0 (not continued)
      *   bits 11-12: F=11 (complete message, frag=3)
@@ -337,7 +348,7 @@ void gen_init_flex(struct gen_params *p, struct gen_state *s)
         codewords[msg_start + 1 + i] = build_message_word(msg_words[i]);
     }
 
-    /* Compute K checksum (10-bit, Section 3.10.1.3):
+    /* Compute K checksum (10-bit):
      * 1's complement of binary sum of all message words (header + content)
      * in three groups per word: bits 0-7, 8-15, 16-20.
      * K field (bits 0-9 of header) is zeroed during computation.
@@ -399,7 +410,7 @@ void gen_init_flex(struct gen_params *p, struct gen_state *s)
     add_bits_lsb(s->s.flex.data, &bit_idx, fiw, 32);
     
     /* SYNC2: BS2(4) + C(16) + inv.BS2(4) + inv.C(16) = 40 bits at 1600/2FSK
-     * Per ARIB STD-43A Table 3.2-6:
+     * Per the FLEX standard:
      *   C = 0xED84 (16 bits), inv.C = 0x127B
      *   BS2 = alternating dotting (4 bits) */
     /* BS2: 4 bits dotting */

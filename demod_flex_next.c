@@ -683,11 +683,11 @@ static unsigned int count_bits(struct Flex_Next * flex, unsigned int data) {
 static int bch3121_fix_errors(struct Flex_Next * flex, uint32_t * data_to_fix, char PhaseNo) {
   if (flex==NULL) return -1;
 
-  unsigned int original = *data_to_fix & 0x7FFFFFFF;
+  unsigned int original = *data_to_fix;
   unsigned int data = original;
   
-  /*Decode and correct using new bch library*/
-  int result = bch_flex_correct(&data);
+  /*Decode and correct using bch library with even parity check*/
+  int result = bch_flex_next_correct(&data);
 
   /*Decode successful?*/
   if (result >= 0) {
