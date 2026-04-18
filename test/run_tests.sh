@@ -106,6 +106,45 @@ if [ -d "$BCH_REF_DIR" ]; then
 fi
 
 # =============================================================================
+# GSC decoder tests
+# =============================================================================
+echo
+echo "GSC decoder tests:"
+
+run_test "GSC tone" "GSC" "flac" "$SAMPLES_DIR/gsc_capture.flac" \
+    "GSC: Address: 5050059  Function: 1  Tone" \
+    || FAILED=1
+
+run_test "GSC numeric short" "GSC" "flac" "$SAMPLES_DIR/gsc_capture.flac" \
+    "GSC: Address: 2345675  Function: 1  Numeric: \"555-1234\"" \
+    || FAILED=1
+
+run_test "GSC numeric max" "GSC" "flac" "$SAMPLES_DIR/gsc_capture.flac" \
+    "GSC: Address: 3456785  Function: 1  Numeric: \"123456789012345678901234\"" \
+    || FAILED=1
+
+run_test "GSC alpha short" "GSC" "flac" "$SAMPLES_DIR/gsc_capture.flac" \
+    "GSC: Address: 3333335  Function: 1  Alpha:   \"CALL 555-1234\"" \
+    || FAILED=1
+
+run_test "GSC alpha long" "GSC" "flac" "$SAMPLES_DIR/gsc_capture.flac" \
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ" \
+    "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG" \
+    || FAILED=1
+
+run_test "GSC voice" "GSC" "flac" "$SAMPLES_DIR/gsc_capture.flac" \
+    "GSC: Address: 1234561  Function: 1  Voice: message start" \
+    "GSC: Address: 1234561  Function: 1  Voice: message end" \
+    || FAILED=1
+
+run_test "GSC preamble indices" "GSC" "flac" "$SAMPLES_DIR/gsc_capture.flac" \
+    "PREAMBLE0" \
+    "PREAMBLE1" \
+    "PREAMBLE5" \
+    "PREAMBLE9" \
+    || FAILED=1
+
+# =============================================================================
 # End-to-end tests (gen-ng -> multimon-ng)
 # =============================================================================
 if [ -z "$WINE_CMD" ]; then
