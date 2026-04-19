@@ -330,6 +330,7 @@ struct Flex_Fragment {
   uint32_t                    sig_sum;       // accumulated signature sum across fragments
   uint32_t                    rx_sig;        // received signature from initial fragment
   int                         sig_valid;     // 1 if all fragment words were clean
+  int                         k_fail;        // 1 if any fragment had K checksum failure
   int                         expected_f;    // next expected F value (mod 3 sequence: 11->00->01->10->00...)
   int                         frag_index;    // fragment counter (0=initial, 1=first cont, ...)
   int                         f_mismatch;    // 1 if any F sequence mismatch detected (missing fragment)
@@ -1038,6 +1039,7 @@ static int frag_alloc(struct Flex_Next * flex, int64_t capcode, int type, int ms
       flex->FragStore.slots[i].sig_sum = 0;
       flex->FragStore.slots[i].rx_sig = 0;
       flex->FragStore.slots[i].sig_valid = 0;
+      flex->FragStore.slots[i].k_fail = 0;
       flex->FragStore.slots[i].expected_f = 0;  // after F=11 (initial), next expected is F=00
       flex->FragStore.slots[i].frag_index = 0;
       flex->FragStore.slots[i].f_mismatch = 0;
@@ -1066,6 +1068,7 @@ static int frag_alloc(struct Flex_Next * flex, int64_t capcode, int type, int ms
     flex->FragStore.slots[oldest].sig_sum = 0;
     flex->FragStore.slots[oldest].rx_sig = 0;
     flex->FragStore.slots[oldest].sig_valid = 0;
+    flex->FragStore.slots[oldest].k_fail = 0;
     flex->FragStore.slots[oldest].expected_f = 0;
     flex->FragStore.slots[oldest].frag_index = 0;
     flex->FragStore.slots[oldest].f_mismatch = 0;
@@ -1093,6 +1096,7 @@ static void frag_release(struct Flex_Next * flex, int slot) {
   flex->FragStore.slots[slot].sig_sum = 0;
   flex->FragStore.slots[slot].rx_sig = 0;
   flex->FragStore.slots[slot].sig_valid = 0;
+  flex->FragStore.slots[slot].k_fail = 0;
   flex->FragStore.slots[slot].expected_f = 0;
   flex->FragStore.slots[slot].frag_index = 0;
   flex->FragStore.slots[slot].f_mismatch = 0;
@@ -1292,6 +1296,9 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
               verbprintf(3, "FLEX_NEXT: Alpha K checksum FAIL: rx=0x%03X expected=0x%03X\n", rx_k, expected_k);
               k_fail = 1;
             }
+          } else {
+            /* BCH errors prevented K verification - treat as fail */
+            k_fail = 1;
           }
         }
 
@@ -1354,10 +1361,15 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
 
         // Verify signature on complete (non-fragmented) messages
         int sig_fail = 0;
-        if (is_initial && cont == 0 && sig_valid && len > 0) {
-          uint32_t expected_sig = (~sig_sum) & 0x7Fu;
-          if (rx_sig != expected_sig) {
-            verbprintf(3, "FLEX_NEXT: Alpha signature FAIL: rx=0x%02X expected=0x%02X\n", rx_sig, expected_sig);
+        if (is_initial && cont == 0 && len > 0) {
+          if (sig_valid) {
+            uint32_t expected_sig = (~sig_sum) & 0x7Fu;
+            if (rx_sig != expected_sig) {
+              verbprintf(3, "FLEX_NEXT: Alpha signature FAIL: rx=0x%02X expected=0x%02X\n", rx_sig, expected_sig);
+              sig_fail = 1;
+            }
+          } else {
+            /* BCH errors prevented signature verification - treat as fail */
             sig_fail = 1;
           }
         }
@@ -1367,7 +1379,29 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
           // First/middle fragment: buffer it
           unsigned int abs_frame = flex->FIW.cycleno * 128 + flex->FIW.frameno;
           int slot = frag_find(flex, flex->Decode.capcode, flex->Decode.type, msg_n);
-          if (slot >= 0 && is_initial && msg_r == 1) {
+          if (slot >= 0 && is_initial) {
+            /* New initial fragment for same capcode: emit old partial, then release */
+            if (flex->FragStore.slots[slot].data_len > 0) {
+              if (json_mode) {
+                flex_next_json_emit(flex, flex->Decode.phase,
+                                    flex->FragStore.slots[slot].capcode,
+                                    flex->Decode.addr_type, 0,
+                                    flex->FragStore.slots[slot].type,
+                                    "ALN", "reassembled_partial",
+                                    flex->FragStore.slots[slot].msg_n, -1, -1,
+                                    flex->FragStore.slots[slot].k_fail ? 0 : -1, -1,
+                                    (const char *)flex->FragStore.slots[slot].data,
+                                    NULL, 0, NULL);
+              } else {
+                verbprintf(0, "FLEX_NEXT|%u/%u|%02u.%03u.%c|%010" PRId64 "|LS|5|ALN|0.0.C.N%d|%.*s\n",
+                           flex->Sync.baud, flex->Sync.levels,
+                           flex->FIW.cycleno, flex->FIW.frameno, flex->Decode.phase,
+                           flex->FragStore.slots[slot].capcode,
+                           flex->FragStore.slots[slot].msg_n,
+                           (int)flex->FragStore.slots[slot].data_len,
+                           flex->FragStore.slots[slot].data);
+              }
+            }
             frag_release(flex, slot);
             slot = -1;
           }
@@ -1379,6 +1413,7 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
               flex->FragStore.slots[slot].rx_sig = rx_sig;
               flex->FragStore.slots[slot].sig_sum = sig_sum;
               flex->FragStore.slots[slot].sig_valid = sig_valid;
+              flex->FragStore.slots[slot].k_fail = k_fail;
               flex->FragStore.slots[slot].msg_r = msg_r;
               flex->FragStore.slots[slot].msg_m = msg_m;
               // F=11 (initial): next expected is F=00
@@ -1387,6 +1422,7 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
             } else {
               flex->FragStore.slots[slot].sig_sum += sig_sum;
               if (!sig_valid) flex->FragStore.slots[slot].sig_valid = 0;
+              if (k_fail) flex->FragStore.slots[slot].k_fail = 1;
               // Check F sequence: expected_f should match received frag
               if (frag != flex->FragStore.slots[slot].expected_f) {
                 verbprintf(3, "FLEX_NEXT: F sequence mismatch for cap %" PRId64 ": expected F=%d got F=%d (missing fragment?)\n",
@@ -1443,11 +1479,14 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
           if (slot >= 0 && flex->FragStore.slots[slot].data_len > 0) {
             // Validate signature across all fragments
             int reassembled_sig_fail = 0;
-            uint32_t total_sig_sum = flex->FragStore.slots[slot].sig_sum + sig_sum;
             if (flex->FragStore.slots[slot].sig_valid && sig_valid) {
+              uint32_t total_sig_sum = flex->FragStore.slots[slot].sig_sum + sig_sum;
               uint32_t expected_sig = (~total_sig_sum) & 0x7Fu;
               if (flex->FragStore.slots[slot].rx_sig != expected_sig)
                 reassembled_sig_fail = 1;
+            } else {
+              /* BCH errors prevented signature verification - treat as fail */
+              reassembled_sig_fail = 1;
             }
             // Check F sequence on final fragment
             if (frag != flex->FragStore.slots[slot].expected_f) {
@@ -1480,11 +1519,12 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
               cJSON_AddNumberToObject(extra, "total_fragments", total_frags);
               cJSON_AddNumberToObject(extra, "total_chars", total_chars);
               cJSON_AddBoolToObject(extra, "frag_seq_error", flex->FragStore.slots[slot].f_mismatch ? 1 : 0);
+              int combined_k_fail = k_fail || flex->FragStore.slots[slot].k_fail;
               flex_next_json_emit(flex, flex->Decode.phase, flex->Decode.capcode,
                                   flex->Decode.addr_type, flex_groupmessage, flex->Decode.type,
                                   "ALN", "reassembled",
                                   msg_n, out_r, out_m,
-                                  k_fail ? 0 : 1, reassembled_sig_fail ? 0 : 1,
+                                  combined_k_fail ? 0 : 1, reassembled_sig_fail ? 0 : 1,
                                   reassembled,
                                   flex_groupmessage ? &flex->GroupHandler.GroupCodes[flex_groupbit][1] : NULL,
                                   flex_groupmessage ? (int)flex->GroupHandler.GroupCodes[flex_groupbit][CAPCODES_INDEX] : 0, extra);
@@ -1652,6 +1692,9 @@ static void parse_numeric(struct Flex_Next * flex, unsigned int * phaseptr, int 
                    rx_k, expected_k);
         num_k_fail = 1;
       }
+    } else {
+      /* BCH errors prevented K verification - treat as fail */
+      num_k_fail = 1;
     }
   }
 
@@ -2026,7 +2069,8 @@ static void parse_binary(struct Flex_Next * flex, unsigned int * phaseptr, int *
   // S is the 1's complement of the binary sum of all data bytes
   // (8 bits at a time), starting after the S field.  Termination
   // bits are NOT included.  Only validate on complete messages (K).
-  if (is_initial && hex_has_sig && cont == 0) {
+  if (is_initial && cont == 0) {
+    if (hex_has_sig) {
     int total_data_bits = hi * 4;
     uint32_t sig_sum = 0;
     int bit_pos = 0;
@@ -2049,6 +2093,10 @@ static void parse_binary(struct Flex_Next * flex, unsigned int * phaseptr, int *
     if (hex_rx_sig != expected_sig) {
       verbprintf(3, "FLEX_NEXT: HEX signature FAIL: rx=0x%02X expected=0x%02X\n",
                  hex_rx_sig, expected_sig);
+      hex_sig_fail = 1;
+    }
+    } else {
+      /* BCH errors prevented signature verification - treat as fail */
       hex_sig_fail = 1;
     }
   }
