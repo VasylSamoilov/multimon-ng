@@ -292,8 +292,16 @@ static int reverse_word1(unsigned short w1, int *g1, int *g0)
 
 static int reverse_word2(unsigned short w2, int g1g0, int *a2, int *a1, int *a0)
 {
+    /* Illegal pager codes (Table VIII, §3.2) */
+    static const unsigned short illegal_low[16] = {
+        0, 25, 51, 103, 206, 340, 363, 412, 445, 530, 642, 726, 782, 810, 825, 877
+    };
+    static const unsigned short illegal_high[7] = {
+        0, 292, 425, 584, 631, 841, 851
+    };
     int raw, b3b2, b1b0;
     int ap3, ap2, ap1, ap0, ap;
+    int a2a1a0, i;
 
     if (g1g0 >= 50)
         raw = w2 - 50;
@@ -320,6 +328,18 @@ static int reverse_word2(unsigned short w2, int g1g0, int *a2, int *a1, int *a0)
      * arithmetic overflows for invalid range combinations. */
     if (*a2 < 0 || *a2 > 9 || *a1 < 0 || *a1 > 9 || *a0 < 0 || *a0 > 9)
         return -1;
+
+    /* Validate against illegal address tables (Table VIII) */
+    a2a1a0 = (*a2) * 100 + (*a1) * 10 + (*a0);
+    if (g1g0 < 50) {
+        for (i = 0; i < 16; i++)
+            if (a2a1a0 == (int)illegal_low[i])
+                return -1;
+    } else {
+        for (i = 0; i < 7; i++)
+            if (a2a1a0 == (int)illegal_high[i])
+                return -1;
+    }
 
     return 0;
 }
@@ -497,21 +517,13 @@ static int gsc_decode_batch(struct gsc_state *gsc, int force)
     unsigned short w2_value = 0;
     int w2_inverted = 0;
 
-    /* Store up to 2 candidate addresses (low range, high range) */
-    int n_candidates = 0;
-    int cand_g1[2], cand_g0[2], cand_a2[2], cand_a1[2], cand_a0[2];
-    int cand_inv[2], cand_g1g0[2];
-
     {
         unsigned int w2_cw = read_dup_golay(bits, &pos);
         unsigned short w2_try[2] = {0, 0};
         int golay_ok[2] = {0, 0};
-        int try_g1g0[2];
         int ta2, ta1, ta0;
-        int inv, rng;
-
-        try_g1g0[0] = g1g0;
-        try_g1g0[1] = g1g0 + 50;
+        int inv, det_range;
+        int best_inv = -1;
 
         /* Try normal Golay decode */
         {
@@ -533,40 +545,31 @@ static int gsc_decode_batch(struct gsc_state *gsc, int force)
             }
         }
 
-        /* Try all 4 combinations, collect all valid candidates */
+        /* Determine range from W2 value: b1b0 is always 0-49, so
+         * W2 % 100 < 50 means low range, >= 50 means high range. */
         for (inv = 0; inv < 2; inv++) {
             if (!golay_ok[inv])
                 continue;
-            for (rng = 0; rng < 2; rng++) {
-                if (reverse_word2(w2_try[inv], try_g1g0[rng], &ta2, &ta1, &ta0) == 0) {
-                    if (n_candidates < 2) {
-                        cand_inv[n_candidates] = inv;
-                        cand_g1g0[n_candidates] = try_g1g0[rng];
-                        cand_g1[n_candidates] = try_g1g0[rng] / 10;
-                        cand_g0[n_candidates] = try_g1g0[rng] % 10;
-                        cand_a2[n_candidates] = ta2;
-                        cand_a1[n_candidates] = ta1;
-                        cand_a0[n_candidates] = ta0;
-                        n_candidates++;
+            det_range = (w2_try[inv] % 100 >= 50) ? 1 : 0;
+            if (reverse_word2(w2_try[inv], g1g0 + det_range * 50, &ta2, &ta1, &ta0) == 0) {
+                if (best_inv < 0) {
+                    best_inv = inv;
+                    w2_value = w2_try[inv];
+                    w2_inverted = inv;
+                    a2 = ta2; a1 = ta1; a0 = ta0;
+                    if (det_range) {
+                        g1g0 += 50;
+                        g1 = g1g0 / 10;
+                        g0 = g1g0 % 10;
                     }
                 }
             }
         }
 
-        if (n_candidates == 0) {
+        if (best_inv < 0) {
             verbprintf(5, "GSC: W2 no valid address from any combination (w2_cw=0x%06x)\n", w2_cw);
             return -1;
         }
-
-        /* Use first candidate as primary */
-        w2_value = w2_try[cand_inv[0]];
-        w2_inverted = cand_inv[0];
-        a2 = cand_a2[0];
-        a1 = cand_a1[0];
-        a0 = cand_a0[0];
-        g1g0 = cand_g1g0[0];
-        g1 = cand_g1[0];
-        g0 = cand_g0[0];
     }
 
     /* Compute function number from inversion flags: function = (W1_inv << 1) | W2_inv */
@@ -575,19 +578,10 @@ static int gsc_decode_batch(struct gsc_state *gsc, int force)
     /* Compute index digit: preamble = (idx + g0) % 10 */
     int idx = (gsc->preamble_index - g0 + 10) % 10;
 
-    /* Build address string. When both g1g0 ranges produce valid addresses
-     * (ambiguity from the W1 table mapping two g1g0 values to the same
-     * entry), show the primary
-     * address normally and log the alternate at debug level. */
+    /* Build address string. The W2 value's low two digits deterministically
+     * identify the high/low range, so there is no ambiguity. */
     char addr_str[16];
     snprintf(addr_str, sizeof(addr_str), "%d%d%d%d%d%d", idx, g1, g0, a2, a1, a0);
-
-    if (n_candidates == 2) {
-        int idx2 = (gsc->preamble_index - cand_g0[1] + 10) % 10;
-        verbprintf(7, "GSC: Ambiguous address: %d%d%d%d%d%d or %d%d%d%d%d%d (W2 maps to both g1g0=%d and %d)\n", idx,
-                   g1, g0, a2, a1, a0, idx2, cand_g1[1], cand_g0[1], cand_a2[1], cand_a1[1], cand_a0[1], cand_g1g0[0],
-                   cand_g1g0[1]);
-    }
 
     verbprintf(5, "GSC: Address decode: W1=%u(%s) W2=%u(%s) func=%d g1g0=%d idx=%d -> %d%d%d%d%d%d\n", w1_value,
                w1_inverted ? "inv" : "norm", w2_value, w2_inverted ? "inv" : "norm", function, g1g0, idx, idx, g1, g0,
@@ -680,7 +674,8 @@ static int gsc_decode_batch(struct gsc_state *gsc, int force)
         suffix = '5' + function;
         break;
     default: /* tone */
-        suffix = (function == 0) ? '9' : '0';
+        /* Table IX tone suffixes: func 1->9, 2->0, 3->3, 4->4 */
+        suffix = "9034"[function];
         break;
     }
 
@@ -955,7 +950,7 @@ static int gsc_decode_batch(struct gsc_state *gsc, int force)
                        numeric_fill);
         } else {
             /* No content decoded - treat as tone */
-            suffix = (function == 0) ? '9' : '0';
+            suffix = "9034"[function];
             verbprintf(0, "GSC: Address: %s%c  Function: %d  Tone\n", addr_str, suffix, function + 1);
         }
         } /* end of short-message scoring/voting */
@@ -1061,20 +1056,21 @@ static int gsc_decode_batch(struct gsc_state *gsc, int force)
             peek_try = w2_cw ^ 0x7FFFFF;
             if (bch_golay_correct(&peek_try) >= 0) { w2_try[1] = peek_try; w2_ok[1] = 1; }
 
-            int best_inv = -1, best_range = -1;
-            int try_g1g0[2] = { bm_g1g0, bm_g1g0 + 50 };
+            int best_inv = -1;
             for (int inv = 0; inv < 2; inv++) {
                 if (!w2_ok[inv]) continue;
-                for (int rng = 0; rng < 2; rng++) {
-                    int ta2, ta1, ta0;
-                    if (reverse_word2((unsigned short)w2_try[inv], try_g1g0[rng], &ta2, &ta1, &ta0) == 0) {
-                        if (best_inv < 0) { best_inv = inv; best_range = rng; bm_a2 = ta2; bm_a1 = ta1; bm_a0 = ta0; }
+                int det_range = (w2_try[inv] % 100 >= 50) ? 1 : 0;
+                int ta2, ta1, ta0;
+                if (reverse_word2((unsigned short)w2_try[inv], bm_g1g0 + det_range * 50, &ta2, &ta1, &ta0) == 0) {
+                    if (best_inv < 0) {
+                        best_inv = inv;
+                        bm_a2 = ta2; bm_a1 = ta1; bm_a0 = ta0;
+                        if (det_range) { bm_g1g0 += 50; bm_g1 = bm_g1g0 / 10; bm_g0 = bm_g1g0 % 10; }
                     }
                 }
             }
             if (best_inv < 0) break;
             bm_w2_inverted = best_inv;
-            if (best_range == 1) { bm_g1g0 = try_g1g0[1]; bm_g1 = bm_g1g0 / 10; bm_g0 = bm_g1g0 % 10; }
 
             int bm_function = (bm_w1_inverted ? 0x2 : 0) | (bm_w2_inverted ? 0x1 : 0);
             int bm_idx = (gsc->preamble_index - bm_g0 + 10) % 10;
@@ -1159,7 +1155,7 @@ static int gsc_decode_batch(struct gsc_state *gsc, int force)
                            bm_addr, bm_suffix, bm_function + 1, esc_nl(bm_alpha));
             } else {
                 /* Tone or unknown */
-                char bm_suffix = (bm_function == 0) ? '9' : '0';
+                char bm_suffix = "9034"[bm_function];
                 verbprintf(0, "GSC: Address: %s%c  Function: %d  Tone\n", bm_addr, bm_suffix, bm_function + 1);
             }
 
