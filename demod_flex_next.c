@@ -160,7 +160,8 @@ extern int json_mode;
 #define REPORT_GROUP_CODES   1       // Report each cleared faulty group capcode : 0 = Each on a new line; 1 = All on the same line;
 
 #define FLEX_SYNC_MARKER     0xA6C6AAAAul  // Synchronisation code marker for FLEX
-#define SLICE_THRESHOLD      0.667         // For 4 level code, levels 0 and 3 have 3 times the amplitude of levels 1 and 2, so quantise at 2/3
+#define SLICE_THRESHOLD      0.6659        // 4-level quantization threshold (optimized from 2/3)
+#define SLICE_THRESHOLD_IAD  0.665         // Integrate-and-dump alternate slicer threshold
 #define DC_OFFSET_FILTER     0.010         // DC Offset removal IIR filter response (seconds)
 #define PHASE_LOCKED_RATE    0.045         // Correction factor for locked state
 #define PHASE_UNLOCKED_RATE  0.050         // Correction factor for unlocked state
@@ -215,6 +216,8 @@ struct Flex_Demodulator {
   int                         envelope_count;
   uint64_t                    lock_buf;
   int                         symcount[4];
+  double                      sym_sum;         // integrate-and-dump: sample sum over symbol period
+  int                         sym_n;           // integrate-and-dump: sample count over symbol period
   int                         timeout;
   int                         nonconsec;
   unsigned int                baud;          // Current baud rate
@@ -287,6 +290,11 @@ struct Flex_Data {
   struct Flex_Phase           PhaseB;
   struct Flex_Phase           PhaseC;
   struct Flex_Phase           PhaseD;
+  /* Alternate phase buffers from integrate-and-dump slicer */
+  struct Flex_Phase           AltA;
+  struct Flex_Phase           AltB;
+  struct Flex_Phase           AltC;
+  struct Flex_Phase           AltD;
 };
 
 
@@ -3358,12 +3366,24 @@ static void clear_phase_data(struct Flex_Next * flex) {
     flex->Data.PhaseB.bch_err[i]=0;
     flex->Data.PhaseC.bch_err[i]=0;
     flex->Data.PhaseD.bch_err[i]=0;
+    flex->Data.AltA.buf[i]=0;
+    flex->Data.AltB.buf[i]=0;
+    flex->Data.AltC.buf[i]=0;
+    flex->Data.AltD.buf[i]=0;
+    flex->Data.AltA.bch_err[i]=0;
+    flex->Data.AltB.bch_err[i]=0;
+    flex->Data.AltC.bch_err[i]=0;
+    flex->Data.AltD.bch_err[i]=0;
   }
 
   flex->Data.PhaseA.idle_count=0;
   flex->Data.PhaseB.idle_count=0;
   flex->Data.PhaseC.idle_count=0;
   flex->Data.PhaseD.idle_count=0;
+  flex->Data.AltA.idle_count=0;
+  flex->Data.AltB.idle_count=0;
+  flex->Data.AltC.idle_count=0;
+  flex->Data.AltD.idle_count=0;
 
   flex->Data.phase_toggle=0;
   flex->Data.data_bit_counter=0;
@@ -3397,6 +3417,52 @@ static void decode_data(struct Flex_Next * flex) {
       decode_phase(flex, 'A');
       decode_phase(flex, 'C');
     } else {
+      /* 3200/4FSK: BCH-decode alternate buffers, then substitute
+       * alt words into primary where alt BCH succeeds but primary
+       * would fail. Primary BCH happens inside decode_phase. */
+      {
+        struct { struct Flex_Phase *pri; struct Flex_Phase *alt; } pairs[] = {
+          { &flex->Data.PhaseA, &flex->Data.AltA },
+          { &flex->Data.PhaseB, &flex->Data.AltB },
+          { &flex->Data.PhaseC, &flex->Data.AltC },
+          { &flex->Data.PhaseD, &flex->Data.AltD },
+        };
+        char phase_names[] = "ABCD";
+
+        int improved = 0;
+        for (int p = 0; p < 4; p++) {
+          /* Parse BIW from primary to find frame structure. */
+          uint32_t biw_tmp = pairs[p].pri->buf[0];
+          int biw_ok = (bch3121_fix_errors(flex, &biw_tmp, phase_names[p]) >= 0);
+          unsigned int voffset = PHASE_WORDS;
+          unsigned int aoffset_val = 1;
+          if (biw_ok) {
+            biw_tmp &= 0x1FFFFFL;
+            voffset = (biw_tmp >> 10) & 0x3fL;
+            aoffset_val = ((biw_tmp >> 8) & 0x3L) + 1;
+            if (voffset == 0) voffset = PHASE_WORDS;
+          }
+
+          /* Substitute safe regions: BIW region (< aoffset) + body (>= voffset).
+           * Address words (aoffset to voffset-1) are skipped to preserve
+           * frame parsing integrity. When primary BIW is uncorrectable,
+           * voffset=PHASE_WORDS and aoffset=1, so only word 0 (BIW) is
+           * substituted — this recovers the phase for decode_phase. */
+          for (unsigned int w = 0; w < PHASE_WORDS; w++) {
+            uint32_t alt_word = pairs[p].alt->buf[w];
+            int alt_rc = bch3121_fix_errors(flex, &alt_word, phase_names[p]);
+            uint32_t pri_word = pairs[p].pri->buf[w];
+            int pri_rc = bch3121_fix_errors(flex, &pri_word, phase_names[p]);
+
+            if (pri_rc != 0 && alt_rc >= 0 && (w < aoffset_val || w >= voffset)) {
+              pairs[p].pri->buf[w] = pairs[p].alt->buf[w];
+              improved++;
+            }
+          }
+        }
+        if (improved)
+          verbprintf(3, "FLEX_NEXT: I&D merge improved %d words\n", improved);
+      }
       decode_phase(flex, 'A');
       decode_phase(flex, 'B');
       decode_phase(flex, 'C');
@@ -3745,9 +3811,9 @@ static int buildSymbol(struct Flex_Next * flex, double sample) {
                 flex->State.Current = FLEX_STATE_SYNC1;
         }
 
-        /* MID 80% SYMBOL PERIOD */
+        /* MID 80% SYMBOL PERIOD: accumulate for both majority vote and I&D */
         if (phasepercent > 10 && phasepercent <90) {
-                /*Count the number of occurrences of each symbol value for analysis at end of symbol period*/
+                /* Majority vote bins */
                 if (sample > 0) {
                         if (sample > flex->Modulation.envelope*SLICE_THRESHOLD)
                                 flex->Demodulator.symcount[3]++;
@@ -3759,6 +3825,17 @@ static int buildSymbol(struct Flex_Next * flex, double sample) {
                                 flex->Demodulator.symcount[0]++;
                         else
                                 flex->Demodulator.symcount[1]++;
+                }
+                /* Integrate-and-dump: use tighter window that excludes
+                 * inter-symbol transitions.  Transition duration is
+                 * ~sample_rate/(2*baud) samples per side, which is
+                 * 50*baud/sample_rate percent of the symbol period.
+                 * At 3200 baud/22050 Hz: ~7.3% per side -> 25%-75% window.
+                 * At 1600 baud/22050 Hz: ~3.6% per side -> 14%-86% window.
+                 * Use 25% margin to be safe. */
+                if (phasepercent > 25 && phasepercent < 75) {
+                        flex->Demodulator.sym_sum += sample;
+                        flex->Demodulator.sym_n++;
                 }
         }
 
@@ -3817,13 +3894,13 @@ static void Flex_Demodulate(struct Flex_Next * flex, double sample) {
     flex->Demodulator.symbol_count++;
     flex->Modulation.symbol_rate = 1.0 * flex->Demodulator.symbol_count*flex->Demodulator.sample_freq / flex->Demodulator.sample_count;
 
-    /*Determine the modal symbol*/
+    /* PRIMARY: Majority vote symbol decision (original method) */
     int j;
     int decmax = 0;
-    int modal_symbol = 0;
+    int symbol = 0;
     for (j = 0; j<4; j++) {
       if (flex->Demodulator.symcount[j] > decmax) {
-        modal_symbol = j;
+        symbol = j;
         decmax = flex->Demodulator.symcount[j];
       }
     }
@@ -3832,15 +3909,48 @@ static void Flex_Demodulate(struct Flex_Next * flex, double sample) {
     flex->Demodulator.symcount[2] = 0;
     flex->Demodulator.symcount[3] = 0;
 
+    /* ALTERNATE: Integrate-and-dump symbol decision */
+    int alt_symbol = 1;
+    if (flex->Demodulator.sym_n > 0) {
+      double mean = flex->Demodulator.sym_sum / flex->Demodulator.sym_n;
+      double thr = flex->Modulation.envelope * SLICE_THRESHOLD_IAD;
+      if (mean > 0)
+        alt_symbol = (mean > thr) ? 3 : 2;
+      else
+        alt_symbol = (mean < -thr) ? 0 : 1;
+    }
+    flex->Demodulator.sym_sum = 0;
+    flex->Demodulator.sym_n = 0;
+
+    /* Feed alternate symbols into AltA/B/C/D during data.
+     * Both bit_a and bit_b may differ between vote and I&D. */
+    if (flex->Demodulator.locked && flex->State.Current == FLEX_STATE_DATA
+        && flex->Sync.levels == 4 && flex->Sync.baud == 3200) {
+      /* Use I&D's own bit_a and bit_b for alternate phase buffers. */
+      int alt_bit_a = (alt_symbol > 1);
+      int alt_bit_b = (alt_symbol == 1) || (alt_symbol == 2);
+      unsigned int idx = ((flex->Data.data_bit_counter>>5)&0xFFF8) | (flex->Data.data_bit_counter&0x0007);
+      if (idx < PHASE_WORDS) {
+        if (flex->Data.phase_toggle == 0) {
+          /* Even symbol: bit_a -> AltA, bit_b -> AltB */
+          flex->Data.AltA.buf[idx] = (flex->Data.AltA.buf[idx]>>1) | (alt_bit_a?(0x80000000):0);
+          flex->Data.AltB.buf[idx] = (flex->Data.AltB.buf[idx]>>1) | (alt_bit_b?(0x80000000):0);
+        } else {
+          /* Odd symbol: bit_a -> AltC, bit_b -> AltD */
+          flex->Data.AltC.buf[idx] = (flex->Data.AltC.buf[idx]>>1) | (alt_bit_a?(0x80000000):0);
+          flex->Data.AltD.buf[idx] = (flex->Data.AltD.buf[idx]>>1) | (alt_bit_b?(0x80000000):0);
+        }
+      }
+    }
+
 
     if (flex->Demodulator.locked) {
       /*Process the symbol*/
-      flex_sym(flex, modal_symbol);
+      flex_sym(flex, symbol);
     }
     else {
       /*Check for lock pattern*/
-      /*Shift symbols into buffer, symbols are converted so that the max and min symbols map to 1 and 2 i.e each contain a single 1 */
-      flex->Demodulator.lock_buf = (flex->Demodulator.lock_buf << 2) | (modal_symbol ^ 0x1);
+      flex->Demodulator.lock_buf = (flex->Demodulator.lock_buf << 2) | (symbol ^ 0x1);
       uint64_t lock_pattern = flex->Demodulator.lock_buf ^ 0x6666666666666666ull;
       uint64_t lock_mask = (1ull << (2 * LOCK_LEN)) - 1;
       if ((lock_pattern&lock_mask) == 0 || ((~lock_pattern)&lock_mask) == 0) {
