@@ -3458,6 +3458,15 @@ static void decode_data(struct Flex_Next * flex) {
               pairs[p].pri->buf[w] = pairs[p].alt->buf[w];
               improved++;
             }
+            /* Address words: substitute only with perfect BCH and
+             * single-bit raw word distance (safest recovery). */
+            else if (pri_rc != 0 && alt_rc == 0 && w >= aoffset_val && w < voffset) {
+              int ndiff = __builtin_popcount(pairs[p].pri->buf[w] ^ pairs[p].alt->buf[w]);
+              if (ndiff <= 1) {
+                pairs[p].pri->buf[w] = pairs[p].alt->buf[w];
+                improved++;
+              }
+            }
           }
         }
         if (improved)
