@@ -23,6 +23,8 @@
 #include <stdio.h>
 #include <math.h>
 
+extern int json_mode;
+
 /* ---------------------------------------------------------------------- */
 
 #define FREQ_SAMP 22050
@@ -81,6 +83,50 @@ static const char numeric_table[16] = {
 static const char numeric_shift_table[16] = {
     'A', 'B', 'C', 'D', 'E', ' ', 'F', 'G', 'H', 'J', '\0', 'L', 'N', 'P', 'R', '?',
 };
+
+/* ---------------------------------------------------------------------- */
+/* JSON output helper                                                     */
+/* ---------------------------------------------------------------------- */
+
+static void gsc_json_emit(const char *address, int function, const char *msg_type,
+                           const char *message, const char *alt_type,
+                           const char *alt_message, int score, int alt_score,
+                           int blocks, int error_count, int uncorrectable_count,
+                           const char *voice_state, int polarity_inverted)
+{
+    if (!json_mode) return;
+    cJSON *json = cJSON_CreateObject();
+    if (!json) return;
+
+    addJsonTimestamp(json);
+    cJSON_AddStringToObject(json, "protocol", "GSC");
+    cJSON_AddStringToObject(json, "address", address);
+    cJSON_AddNumberToObject(json, "function", function);
+    cJSON_AddStringToObject(json, "polarity", polarity_inverted ? "inverted" : "normal");
+    cJSON_AddStringToObject(json, "msg_type", msg_type);
+
+    if (message)
+        cJSON_AddStringToObject(json, "message", message);
+    if (alt_type) {
+        cJSON_AddStringToObject(json, "alt_type", alt_type);
+        if (alt_message)
+            cJSON_AddStringToObject(json, "alt_message", alt_message);
+        cJSON_AddNumberToObject(json, "score", score);
+        cJSON_AddNumberToObject(json, "alt_score", alt_score);
+    }
+    if (blocks >= 0)
+        cJSON_AddNumberToObject(json, "blocks", blocks);
+    if (error_count >= 0)
+        cJSON_AddNumberToObject(json, "error_count", error_count);
+    if (uncorrectable_count >= 0)
+        cJSON_AddNumberToObject(json, "uncorrectable_count", uncorrectable_count);
+    if (voice_state)
+        cJSON_AddStringToObject(json, "voice_state", voice_state);
+
+    char *out = cJSON_PrintUnformatted(json);
+    if (out) { fprintf(stdout, "%s\n", out); free(out); }
+    cJSON_Delete(json);
+}
 
 /* ---------------------------------------------------------------------- */
 /* GSC decoder state (stored in demod_state)                              */
@@ -829,8 +875,15 @@ static int gsc_decode_batch(struct gsc_state *gsc, int force)
          * Skip scoring/voting entirely. */
         if (block_count > GSC_MAX_NDB) {
             suffix = '5' + function;
-            verbprintf(0, "GSC: Address: %s%c  Function: %d  Alpha:   \"%s\"\n", addr_str, suffix, function + 1,
-                       esc_nl(alpha_msg));
+            if (!json_mode)
+                verbprintf(0, "GSC: Address: %s%c  Function: %d  Alpha:   \"%s\"\n", addr_str, suffix, function + 1,
+                           esc_nl(alpha_msg));
+            else {
+                char full_addr[16]; snprintf(full_addr, sizeof(full_addr), "%s%c", addr_str, suffix);
+                gsc_json_emit(full_addr, function + 1, "alpha", alpha_msg,
+                              NULL, NULL, 0, 0, block_count,
+                              gsc->error_count, gsc->uncorrectable_count, NULL, gsc->polarity_inverted);
+            }
         } else {
 
         /* Content scoring for short messages (1-2 blocks).
@@ -933,55 +986,91 @@ static int gsc_decode_batch(struct gsc_state *gsc, int force)
 
         /* Output decoded message */
         if (is_numeric && numeric_len > 0) {
-            verbprintf(0, "GSC: Address: %s%c  Function: %d  Numeric: \"%s\"\n", addr_str, suffix, function + 1,
-                       numeric_msg);
-            verbprintf(1,
-                       "GSC: Address: %s%c  Function: %d  likely numeric: \"%s\" unlikely alpha: \"%s\" (scores: n=%d "
-                       "a=%d fill: n=%d a=%d)\n",
-                       addr_str, suffix, function + 1, numeric_msg, esc_nl(alpha_msg), numeric_score, alpha_score, numeric_fill,
-                       alpha_fill);
+            if (!json_mode) {
+                verbprintf(0, "GSC: Address: %s%c  Function: %d  Numeric: \"%s\"\n", addr_str, suffix, function + 1,
+                           numeric_msg);
+                verbprintf(1,
+                           "GSC: Address: %s%c  Function: %d  likely numeric: \"%s\" unlikely alpha: \"%s\" (scores: n=%d "
+                           "a=%d fill: n=%d a=%d)\n",
+                           addr_str, suffix, function + 1, numeric_msg, esc_nl(alpha_msg), numeric_score, alpha_score, numeric_fill,
+                           alpha_fill);
+            } else {
+                char full_addr[16]; snprintf(full_addr, sizeof(full_addr), "%s%c", addr_str, suffix);
+                gsc_json_emit(full_addr, function + 1, "numeric", numeric_msg,
+                              "alpha", alpha_msg, numeric_score, alpha_score,
+                              block_count, gsc->error_count, gsc->uncorrectable_count, NULL, gsc->polarity_inverted);
+            }
         } else if (alpha_len > 0) {
-            verbprintf(0, "GSC: Address: %s%c  Function: %d  Alpha:   \"%s\"\n", addr_str, suffix, function + 1,
-                       esc_nl(alpha_msg));
-            verbprintf(1,
-                       "GSC: Address: %s%c  Function: %d  likely alpha: \"%s\" unlikely numeric: \"%s\" (scores: a=%d "
-                       "n=%d fill: a=%d n=%d)\n",
-                       addr_str, suffix, function + 1, esc_nl(alpha_msg), numeric_msg, alpha_score, numeric_score, alpha_fill,
-                       numeric_fill);
+            if (!json_mode) {
+                verbprintf(0, "GSC: Address: %s%c  Function: %d  Alpha:   \"%s\"\n", addr_str, suffix, function + 1,
+                           esc_nl(alpha_msg));
+                verbprintf(1,
+                           "GSC: Address: %s%c  Function: %d  likely alpha: \"%s\" unlikely numeric: \"%s\" (scores: a=%d "
+                           "n=%d fill: a=%d n=%d)\n",
+                           addr_str, suffix, function + 1, esc_nl(alpha_msg), numeric_msg, alpha_score, numeric_score, alpha_fill,
+                           numeric_fill);
+            } else {
+                char full_addr[16]; snprintf(full_addr, sizeof(full_addr), "%s%c", addr_str, suffix);
+                gsc_json_emit(full_addr, function + 1, "alpha", alpha_msg,
+                              "numeric", numeric_msg, alpha_score, numeric_score,
+                              block_count, gsc->error_count, gsc->uncorrectable_count, NULL, gsc->polarity_inverted);
+            }
         } else {
             /* No content decoded - treat as tone */
             suffix = "9034"[function];
-            verbprintf(0, "GSC: Address: %s%c  Function: %d  Tone\n", addr_str, suffix, function + 1);
+            if (!json_mode)
+                verbprintf(0, "GSC: Address: %s%c  Function: %d  Tone\n", addr_str, suffix, function + 1);
+            else {
+                char full_addr[16]; snprintf(full_addr, sizeof(full_addr), "%s%c", addr_str, suffix);
+                gsc_json_emit(full_addr, function + 1, "tone", NULL,
+                              NULL, NULL, 0, 0, -1, -1, -1, NULL, gsc->polarity_inverted);
+            }
         }
         } /* end of short-message scoring/voting */
     } else { /* not data */
         /* Tone or voice */
         if (detected_type == 1) {
             /* Voice: output tone first, then voice start */
-            verbprintf(0, "GSC: Address: %s%c  Function: %d  Tone\n", addr_str, suffix, function + 1);
+            {
+                char tone_addr[16]; snprintf(tone_addr, sizeof(tone_addr), "%s%c", addr_str, suffix);
+                if (!json_mode)
+                    verbprintf(0, "GSC: Address: %s%c  Function: %d  Tone\n", addr_str, suffix, function + 1);
+                else
+                    gsc_json_emit(tone_addr, function + 1, "tone", NULL,
+                                  NULL, NULL, 0, 0, -1, -1, -1, NULL, gsc->polarity_inverted);
+            }
 
             /* Verify activation code */
             if (remaining >= GSC_COMMA_LEN + GSC_DUP_BITS + 1 + GSC_DUP_BITS) {
                 pos += GSC_COMMA_LEN;
                 codeword = read_dup_golay(bits, &pos);
                 rc = bch_golay_correct(&codeword);
-                /* Already verified in type detection, just advance pos */
-                pos += 1;            /* skip 1-bit inverted comma */
-                pos += GSC_DUP_BITS; /* skip complement */
+                pos += 1;
+                pos += GSC_DUP_BITS;
             }
 
             {
                 char voice_addr[40];
                 char voice_suffix = '1' + function;
                 snprintf(voice_addr, sizeof(voice_addr), "%s%c", addr_str, voice_suffix);
-                verbprintf(0, "GSC: Address: %s  Function: %d  Voice: message start\n", voice_addr, function + 1);
+                if (!json_mode)
+                    verbprintf(0, "GSC: Address: %s  Function: %d  Voice: message start\n", voice_addr, function + 1);
+                else
+                    gsc_json_emit(voice_addr, function + 1, "voice", NULL,
+                                  NULL, NULL, 0, 0, -1, -1, -1, "start", gsc->polarity_inverted);
                 strncpy(gsc->voice_address, voice_addr, sizeof(gsc->voice_address) - 1);
                 gsc->voice_function = function + 1;
             }
             return 1; /* signal voice mode */
         } else {
             /* Tone only */
-            verbprintf(0, "GSC: Address: %s%c  Function: %d  Tone\n", addr_str, suffix, function + 1);
+            if (!json_mode)
+                verbprintf(0, "GSC: Address: %s%c  Function: %d  Tone\n", addr_str, suffix, function + 1);
+            else {
+                char full_addr[16]; snprintf(full_addr, sizeof(full_addr), "%s%c", addr_str, suffix);
+                gsc_json_emit(full_addr, function + 1, "tone", NULL,
+                              NULL, NULL, 0, 0, -1, -1, -1, NULL, gsc->polarity_inverted);
+            }
         }
     }
 
@@ -1151,12 +1240,25 @@ static int gsc_decode_batch(struct gsc_state *gsc, int force)
                 bm_alpha[bm_alen] = '\0';
 
                 char bm_suffix = '5' + bm_function;
-                verbprintf(0, "GSC: Address: %s%c  Function: %d  Alpha:   \"%s\"\n",
-                           bm_addr, bm_suffix, bm_function + 1, esc_nl(bm_alpha));
+                if (!json_mode)
+                    verbprintf(0, "GSC: Address: %s%c  Function: %d  Alpha:   \"%s\"\n",
+                               bm_addr, bm_suffix, bm_function + 1, esc_nl(bm_alpha));
+                else {
+                    char full_addr[16]; snprintf(full_addr, sizeof(full_addr), "%s%c", bm_addr, bm_suffix);
+                    gsc_json_emit(full_addr, bm_function + 1, "alpha", bm_alpha,
+                                  NULL, NULL, 0, 0, bm_blocks,
+                                  gsc->error_count, gsc->uncorrectable_count, NULL, gsc->polarity_inverted);
+                }
             } else {
                 /* Tone or unknown */
                 char bm_suffix = "9034"[bm_function];
-                verbprintf(0, "GSC: Address: %s%c  Function: %d  Tone\n", bm_addr, bm_suffix, bm_function + 1);
+                if (!json_mode)
+                    verbprintf(0, "GSC: Address: %s%c  Function: %d  Tone\n", bm_addr, bm_suffix, bm_function + 1);
+                else {
+                    char full_addr[16]; snprintf(full_addr, sizeof(full_addr), "%s%c", bm_addr, bm_suffix);
+                    gsc_json_emit(full_addr, bm_function + 1, "tone", NULL,
+                                  NULL, NULL, 0, 0, -1, -1, -1, NULL, gsc->polarity_inverted);
+                }
             }
 
             batch_count++;
@@ -1337,8 +1439,10 @@ static void gsc_rxbit(struct demod_state *s, uint8_t bit)
             try_cw = codeword;
             if (bch_golay_correct(&try_cw) >= 0) {
                 if (match_preamble((unsigned short)try_cw) >= 0) {
-                    verbprintf(0, "GSC: Address: %s  Function: %d  Voice: message end\n", gsc->voice_address,
-                               gsc->voice_function);
+                    if (!json_mode)
+                        verbprintf(0, "GSC: Address: %s  Function: %d  Voice: message end\n", gsc->voice_address, gsc->voice_function);
+                    else
+                        gsc_json_emit(gsc->voice_address, gsc->voice_function, "voice", NULL, NULL, NULL, 0, 0, -1, -1, -1, "end", gsc->polarity_inverted);
                     gsc->confirm_index = match_preamble((unsigned short)try_cw);
                     gsc->confirm_count = 1;
                     gsc->polarity_inverted = 0;
@@ -1351,8 +1455,10 @@ static void gsc_rxbit(struct demod_state *s, uint8_t bit)
                 }
                 /* Check for activation code (voice stop signal) */
                 if ((unsigned short)try_cw == GSC_ACTIVATION_CODE) {
-                    verbprintf(0, "GSC: Address: %s  Function: %d  Voice: message end\n", gsc->voice_address,
-                               gsc->voice_function);
+                    if (!json_mode)
+                        verbprintf(0, "GSC: Address: %s  Function: %d  Voice: message end\n", gsc->voice_address, gsc->voice_function);
+                    else
+                        gsc_json_emit(gsc->voice_address, gsc->voice_function, "voice", NULL, NULL, NULL, 0, 0, -1, -1, -1, "end", gsc->polarity_inverted);
                     gsc->state = GSC_IDLE;
                     gsc->rx_shift_count = 0;
                     gsc->rx_bit_num = 0;
@@ -1364,8 +1470,10 @@ static void gsc_rxbit(struct demod_state *s, uint8_t bit)
             try_cw = codeword ^ 0x7FFFFF;
             if (bch_golay_correct(&try_cw) >= 0) {
                 if (match_preamble((unsigned short)try_cw) >= 0) {
-                    verbprintf(0, "GSC: Address: %s  Function: %d  Voice: message end\n", gsc->voice_address,
-                               gsc->voice_function);
+                    if (!json_mode)
+                        verbprintf(0, "GSC: Address: %s  Function: %d  Voice: message end\n", gsc->voice_address, gsc->voice_function);
+                    else
+                        gsc_json_emit(gsc->voice_address, gsc->voice_function, "voice", NULL, NULL, NULL, 0, 0, -1, -1, -1, "end", gsc->polarity_inverted);
                     gsc->confirm_index = match_preamble((unsigned short)try_cw);
                     gsc->confirm_count = 1;
                     gsc->polarity_inverted = 0;
@@ -1379,8 +1487,10 @@ static void gsc_rxbit(struct demod_state *s, uint8_t bit)
                 }
                 /* Check inverted activation code */
                 if ((unsigned short)try_cw == GSC_ACTIVATION_CODE) {
-                    verbprintf(0, "GSC: Address: %s  Function: %d  Voice: message end\n", gsc->voice_address,
-                               gsc->voice_function);
+                    if (!json_mode)
+                        verbprintf(0, "GSC: Address: %s  Function: %d  Voice: message end\n", gsc->voice_address, gsc->voice_function);
+                    else
+                        gsc_json_emit(gsc->voice_address, gsc->voice_function, "voice", NULL, NULL, NULL, 0, 0, -1, -1, -1, "end", gsc->polarity_inverted);
                     gsc->state = GSC_IDLE;
                     gsc->rx_shift_count = 0;
                     gsc->rx_bit_num = 0;
