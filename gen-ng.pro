@@ -3,6 +3,7 @@ CONFIG += console
 CONFIG -= qt
 CONFIG -= app_bundle
 DEFINES += MAX_VERBOSE_LEVEL=1
+QMAKE_CFLAGS += -std=gnu11
 
 isEmpty(PREFIX) {
  PREFIX = /usr/local/
@@ -12,7 +13,8 @@ target.path = $$PREFIX/bin
 INSTALLS += target
 
 HEADERS += \
-	gen.h
+	gen.h \
+	bch.h
 
 
 SOURCES += \
@@ -23,7 +25,11 @@ SOURCES += \
 	gen_hdlc.c \
 	gen_uart.c \
 	gen_clipfsk.c \
-	costabi.c
+	gen_flex.c \
+	gen_pocsag.c \
+	gen_scope.c \
+	costabi.c \
+	bch.c
 
 macx{
 DEFINES += DUMMY_AUDIO
@@ -40,13 +46,16 @@ LIBS += -lwinmm
 
 
 unix:linux-g++-32:!symbian:!macx{
+DEFINES += DUMMY_AUDIO
 DEFINES += CHARSET_UTF8
 }
 
 unix:linux-g++-64:!symbian:!macx{
+DEFINES += DUMMY_AUDIO
 DEFINES += CHARSET_UTF8
 }
 
 unix:linux-g++:!symbian:!macx{
+DEFINES += DUMMY_AUDIO
 DEFINES += CHARSET_UTF8
 }

@@ -3,6 +3,7 @@ CONFIG += console
 CONFIG -= qt
 CONFIG -= app_bundle
 DEFINES += MAX_VERBOSE_LEVEL=3
+DEFINES += NO_SDL3
 QMAKE_CFLAGS += -std=gnu11
 QMAKE_CFLAGS += -g # For profiling
 
@@ -18,6 +19,7 @@ HEADERS += \
     gen.h \
     filter.h \
     filter-i386.h \
+    bch.h \
     cJSON.h
 
 SOURCES += \
@@ -49,7 +51,7 @@ SOURCES += \
     demod_afsk12.c \
     demod_flex.c \
     demod_flex_next.c \
-    BCHCode.c \
+    bch.c \
     costabi.c \
     costabf.c \
     clip.c \
