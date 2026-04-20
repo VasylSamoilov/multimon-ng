@@ -347,6 +347,8 @@ struct Flex_Fragment {
   int                         expected_f;    // next expected F value (mod 3 sequence: 11->00->01->10->00...)
   int                         frag_index;    // fragment counter (0=initial, 1=first cont, ...)
   int                         f_mismatch;    // 1 if any F sequence mismatch detected (missing fragment)
+  char                        phase;         // phase letter (A/B/C/D) from first fragment
+  char                        addr_type;     // address type char from first fragment
 };
 
 struct Flex_FragStore {
@@ -1056,6 +1058,8 @@ static int frag_alloc(struct Flex_Next * flex, int64_t capcode, int type, int ms
       flex->FragStore.slots[i].expected_f = 0;  // after F=11 (initial), next expected is F=00
       flex->FragStore.slots[i].frag_index = 0;
       flex->FragStore.slots[i].f_mismatch = 0;
+      flex->FragStore.slots[i].phase = '?';
+      flex->FragStore.slots[i].addr_type = '?';
       return i;
     }
   }
@@ -1085,6 +1089,8 @@ static int frag_alloc(struct Flex_Next * flex, int64_t capcode, int type, int ms
     flex->FragStore.slots[oldest].expected_f = 0;
     flex->FragStore.slots[oldest].frag_index = 0;
     flex->FragStore.slots[oldest].f_mismatch = 0;
+    flex->FragStore.slots[oldest].phase = '?';
+    flex->FragStore.slots[oldest].addr_type = '?';
     return oldest;
   }
 }
@@ -1128,9 +1134,9 @@ static void frag_expire(struct Flex_Next * flex, unsigned int current_frame) {
         /* Emit partial message if slot has data */
         if (flex->FragStore.slots[i].data_len > 0) {
           if (json_mode) {
-            flex_next_json_emit(flex, '?',
+            flex_next_json_emit(flex, flex->FragStore.slots[i].phase,
                                 flex->FragStore.slots[i].capcode,
-                                'S', 0,
+                                flex->FragStore.slots[i].addr_type, 0,
                                 flex->FragStore.slots[i].type,
                                 "ALN", "reassembled_partial",
                                 flex->FragStore.slots[i].msg_n, -1, -1,
@@ -1138,11 +1144,14 @@ static void frag_expire(struct Flex_Next * flex, unsigned int current_frame) {
                                 (const char *)flex->FragStore.slots[i].data,
                                 NULL, 0, NULL);
           } else {
-            verbprintf(0, "FLEX_NEXT|%u/%u|%02u.%03u.?|%010" PRId64 "|?S|5|ALN|0.0.C.N%d|%.*s\n",
+            verbprintf(0, "FLEX_NEXT|%u/%u|%02u.%03u.%c|%010" PRId64 "|%cS|5|ALN|PARTIAL.N%d%s|%.*s\n",
                        flex->Sync.baud, flex->Sync.levels,
                        current_frame / 128, current_frame % 128,
+                       flex->FragStore.slots[i].phase,
                        flex->FragStore.slots[i].capcode,
+                       flex->FragStore.slots[i].addr_type,
                        flex->FragStore.slots[i].msg_n,
+                       flex->FragStore.slots[i].k_fail ? ".K-" : ".K+",
                        (int)flex->FragStore.slots[i].data_len,
                        flex->FragStore.slots[i].data);
           }
@@ -1418,9 +1427,9 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
             /* New initial fragment for same capcode: emit old partial, then release */
             if (flex->FragStore.slots[slot].data_len > 0) {
               if (json_mode) {
-                flex_next_json_emit(flex, flex->Decode.phase,
+                flex_next_json_emit(flex, flex->FragStore.slots[slot].phase,
                                     flex->FragStore.slots[slot].capcode,
-                                    flex->Decode.addr_type, 0,
+                                    flex->FragStore.slots[slot].addr_type, 0,
                                     flex->FragStore.slots[slot].type,
                                     "ALN", "reassembled_partial",
                                     flex->FragStore.slots[slot].msg_n, -1, -1,
@@ -1428,11 +1437,14 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
                                     (const char *)flex->FragStore.slots[slot].data,
                                     NULL, 0, NULL);
               } else {
-                verbprintf(0, "FLEX_NEXT|%u/%u|%02u.%03u.%c|%010" PRId64 "|LS|5|ALN|0.0.C.N%d|%.*s\n",
+                verbprintf(0, "FLEX_NEXT|%u/%u|%02u.%03u.%c|%010" PRId64 "|%cS|5|ALN|PARTIAL.N%d%s|%.*s\n",
                            flex->Sync.baud, flex->Sync.levels,
-                           flex->FIW.cycleno, flex->FIW.frameno, flex->Decode.phase,
+                           flex->FIW.cycleno, flex->FIW.frameno,
+                           flex->FragStore.slots[slot].phase,
                            flex->FragStore.slots[slot].capcode,
+                           flex->FragStore.slots[slot].addr_type,
                            flex->FragStore.slots[slot].msg_n,
+                           flex->FragStore.slots[slot].k_fail ? ".K-" : ".K+",
                            (int)flex->FragStore.slots[slot].data_len,
                            flex->FragStore.slots[slot].data);
               }
@@ -1444,6 +1456,11 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
             slot = frag_alloc(flex, flex->Decode.capcode, flex->Decode.type, msg_n, abs_frame);
           if (slot >= 0) {
             frag_append(flex, slot, message, (unsigned int)currentChar);
+            /* Store phase/addr_type from first fragment seen in this slot */
+            if (flex->FragStore.slots[slot].phase == '?') {
+              flex->FragStore.slots[slot].phase = flex->Decode.phase;
+              flex->FragStore.slots[slot].addr_type = flex->Decode.addr_type;
+            }
             if (is_initial) {
               flex->FragStore.slots[slot].rx_sig = rx_sig;
               flex->FragStore.slots[slot].sig_sum = sig_sum;
@@ -1473,7 +1490,7 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
           if (!json_mode) {
             int out_r = is_initial ? msg_r : (slot >= 0 ? flex->FragStore.slots[slot].msg_r : -1);
             int out_m = is_initial ? msg_m : (slot >= 0 ? flex->FragStore.slots[slot].msg_m : -1);
-            const char *k_str = k_fail ? ".K-" : "";
+            const char *k_str = k_fail ? ".K-" : ".K+";
             if (out_r >= 0)
               verbprintf(0, "%1d.%1d.%c.N%d.R%d%s%s|%s", frag, cont, frag_flag, msg_n, out_r, out_m ? ".M" : "", k_str, message);
             else
@@ -1535,8 +1552,8 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
             if (!json_mode) {
               int out_r = flex->FragStore.slots[slot].msg_r;
               int out_m = flex->FragStore.slots[slot].msg_m;
-              const char *k_str = k_fail ? ".K-" : "";
-              const char *sig_str = reassembled_sig_fail ? ".SIGN-" : "";
+              const char *k_str = k_fail ? ".K-" : ".K+";
+              const char *sig_str = reassembled_sig_fail ? ".SIG-" : ".SIG+";
               if (out_r >= 0)
                 verbprintf(0, "%1d.%1d.%c.N%d.R%d%s%s%s|%.*s%s", frag, cont, frag_flag, msg_n, out_r, out_m ? ".M" : "", k_str, sig_str,
                            (int)flex->FragStore.slots[slot].data_len, flex->FragStore.slots[slot].data, message);
@@ -1578,7 +1595,7 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
           }
           // No buffered fragment found, output what we have
           if (!json_mode) {
-            verbprintf(0, "%1d.%1d.%c.N%d%s|%s", frag, cont, frag_flag, msg_n, k_fail ? ".K-" : "", message);
+            verbprintf(0, "%1d.%1d.%c.N%d%s|%s", frag, cont, frag_flag, msg_n, k_fail ? ".K-" : ".K+", message);
           } else {
             flex_next_json_emit(flex, flex->Decode.phase, flex->Decode.capcode,
                                 flex->Decode.addr_type, flex_groupmessage, flex->Decode.type,
@@ -1598,8 +1615,8 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
         // K (complete) or unknown: output directly
         if (!json_mode) {
           const char *dup_str = (dedup_flag == 2) ? ".DUP+" : (dedup_flag == 1) ? ".DUP" : "";
-          const char *k_str = k_fail ? ".K-" : "";
-          const char *sig_str = sig_fail ? ".SIGN-" : "";
+          const char *k_str = k_fail ? ".K-" : ".K+";
+          const char *sig_str = sig_fail ? ".SIG-" : ".SIG+";
           verbprintf(0, "%1d.%1d.%c.N%d.R%d%s%s%s%s|%s", frag, cont, frag_flag, msg_n, msg_r, msg_m ? ".M" : "", k_str, sig_str, dup_str, message);
         } else {
           flex_next_json_emit(flex, flex->Decode.phase, flex->Decode.capcode,
@@ -1738,7 +1755,7 @@ static void parse_numeric(struct Flex_Next * flex, unsigned int * phaseptr, int 
   // Numeric messages are always complete per spec.
   if (!json_mode) {
     const char *dup_str = (dedup_flag == 2) ? ".DUP+" : (dedup_flag == 1) ? ".DUP" : "";
-    const char *k_str = num_k_fail ? ".K-" : "";
+    const char *k_str = num_k_fail ? ".K-" : ".K+";
     verbprintf(0, "3.0.K.N%d.R%d%s%s%s|", msg_n, msg_r, msg_m ? ".M" : "", k_str, dup_str);
   }
 
@@ -2258,7 +2275,7 @@ static void parse_binary(struct Flex_Next * flex, unsigned int * phaseptr, int *
   // K (complete): output with frag flags and DUP status
   if (!json_mode) {
     const char *dup_str = (dedup_flag == 2) ? ".DUP+" : (dedup_flag == 1) ? ".DUP" : "";
-    const char *sig_str = hex_sig_fail ? ".SIGN-" : "";
+    const char *sig_str = hex_sig_fail ? ".SIG-" : ".SIG+";
     if (is_initial_hex)
       verbprintf(0, "%c.N%d.R%d%s%s%s|%s", frag_flag, msg_n, msg_r, msg_m ? ".M" : "", sig_str, dup_str, hex);
     else
