@@ -57,3 +57,31 @@ int bch_pocsag_correct(unsigned int *codeword)
     (void)codeword;
     return 0;  /* Stub: always report success */
 }
+
+int bch_flex_next_correct(unsigned int *codeword)
+{
+    (void)codeword;
+    return 0;  /* Stub: always report success */
+}
+
+void bch_gsc_init(void)
+{
+    /* Nothing to initialize */
+}
+
+int bch_golay_correct(unsigned int *codeword)
+{
+    (void)codeword;
+    return 0;  /* Stub: always report success */
+}
+
+unsigned int bch_gsc_encode(unsigned int data)
+{
+    return data & 0x7F;
+}
+
+int bch_gsc_correct(unsigned int *codeword)
+{
+    (void)codeword;
+    return 0;  /* Stub: always report success */
+}
