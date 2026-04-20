@@ -210,11 +210,12 @@ static unsigned int resolve_shift_register(const uint8_t *shift)
     unsigned int codeword = 0;
     int i;
 
+    /* Each bit is transmitted twice. When both copies agree, the value
+     * is reliable. When they disagree, we take bit1 (first copy) —
+     * with only 2 copies there is no majority to vote on. Golay
+     * error correction downstream handles any remaining errors. */
     for (i = 0; i < 23; i++) {
-        uint8_t bit1 = shift[i * 2];
-        uint8_t bit2 = shift[i * 2 + 1];
-        uint8_t resolved = (bit1 == bit2) ? bit1 : bit1;
-        codeword |= ((unsigned int)resolved << i);
+        codeword |= ((unsigned int)(shift[i * 2] & 1) << i);
     }
     return codeword;
 }
@@ -229,10 +230,11 @@ static unsigned int read_dup_golay(const uint8_t *bits, int *pos)
     int p = *pos;
     int i;
 
+    /* The 46-bit block is a 23-bit Golay codeword with each bit
+     * transmitted twice (600 baud, 300 bps effective). Extract
+     * from even positions (first copy of each bit). */
     for (i = 0; i < 23; i++) {
-        uint8_t bit1 = bits[p];
-        uint8_t bit2 = bits[p + 1];
-        codeword |= ((unsigned int)((bit1 == bit2) ? bit1 : bit1) << i);
+        codeword |= ((unsigned int)(bits[p] & 1) << i);
         p += 2;
     }
     *pos = p;
