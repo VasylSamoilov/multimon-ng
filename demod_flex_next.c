@@ -317,9 +317,9 @@ struct Flex_Decode {
 
 
 // Fragment reassembly buffer for multi-part messages (K/F/C flags)
-#define FLEX_FRAG_MAX_SLOTS  16
+#define FLEX_FRAG_MAX_SLOTS  64
 #define FLEX_FRAG_MAX_LEN    2048
-#define FLEX_FRAG_TIMEOUT    64   // frames before expiry
+#define FLEX_FRAG_TIMEOUT    128  // frames before expiry (Section 4.2: up to 128 frames for shared channels)
 
 // Deduplication and word-level combining for complete (K) messages.
 // Stores raw 21-bit words + BCH status so retransmissions can be
@@ -1125,6 +1125,28 @@ static void frag_expire(struct Flex_Next * flex, unsigned int current_frame) {
       unsigned int age = (current_frame - flex->FragStore.slots[i].frame_received) & 0x7FF;
       if (age > FLEX_FRAG_TIMEOUT) {
         verbprintf(3, "FLEX_NEXT: Fragment expired slot %d cap=%" PRId64 " age=%u\n", i, flex->FragStore.slots[i].capcode, age);
+        /* Emit partial message if slot has data */
+        if (flex->FragStore.slots[i].data_len > 0) {
+          if (json_mode) {
+            flex_next_json_emit(flex, '?',
+                                flex->FragStore.slots[i].capcode,
+                                'S', 0,
+                                flex->FragStore.slots[i].type,
+                                "ALN", "reassembled_partial",
+                                flex->FragStore.slots[i].msg_n, -1, -1,
+                                flex->FragStore.slots[i].k_fail ? 0 : -1, -1,
+                                (const char *)flex->FragStore.slots[i].data,
+                                NULL, 0, NULL);
+          } else {
+            verbprintf(0, "FLEX_NEXT|%u/%u|%02u.%03u.?|%010" PRId64 "|?S|5|ALN|0.0.C.N%d|%.*s\n",
+                       flex->Sync.baud, flex->Sync.levels,
+                       current_frame / 128, current_frame % 128,
+                       flex->FragStore.slots[i].capcode,
+                       flex->FragStore.slots[i].msg_n,
+                       (int)flex->FragStore.slots[i].data_len,
+                       flex->FragStore.slots[i].data);
+          }
+        }
         frag_release(flex, i);
       }
     }
@@ -1609,6 +1631,7 @@ group_output:
 
 static void parse_numeric(struct Flex_Next * flex, unsigned int * phaseptr, int * bch_err, int j, int frag, int cont, int msg_n, int msg_r, int msg_m, int dedup_flag) {
   if (flex==NULL) return;
+  (void)frag; (void)cont;  /* Numeric messages cannot be fragmented */
   // BCD table per ARIB STD-43A Section 3.10.1.1:
   //   0-9 = digits, A = spare('.'), B = urgency('U'),
   //   C = space(' '), D = hyphen('-'), E = ']', F = '['
@@ -1712,18 +1735,11 @@ static void parse_numeric(struct Flex_Next * flex, unsigned int * phaseptr, int 
   }
 
   // Output frag flags with N/R/M/K-/DUP
+  // Numeric messages are always complete per spec.
   if (!json_mode) {
-    char frag_flag = '?';
-    if (cont == 0 && frag == 3) frag_flag = 'K';
-    else if (cont == 1)         frag_flag = 'F';
-    else if (cont == 0)         frag_flag = 'C';
-    int is_initial = (frag == 0x03);
     const char *dup_str = (dedup_flag == 2) ? ".DUP+" : (dedup_flag == 1) ? ".DUP" : "";
     const char *k_str = num_k_fail ? ".K-" : "";
-    if (is_initial)
-      verbprintf(0, "%1d.%1d.%c.N%d.R%d%s%s%s|", frag, cont, frag_flag, msg_n, msg_r, msg_m ? ".M" : "", k_str, dup_str);
-    else
-      verbprintf(0, "%1d.%1d.%c.N%d%s%s|", frag, cont, frag_flag, msg_n, k_str, dup_str);
+    verbprintf(0, "3.0.K.N%d.R%d%s%s%s|", msg_n, msg_r, msg_m ? ".M" : "", k_str, dup_str);
   }
 
   // BCD digit extraction
@@ -1774,9 +1790,8 @@ static void parse_numeric(struct Flex_Next * flex, unsigned int * phaseptr, int 
     const char *tag = (flex->Decode.type == FLEX_PAGETYPE_SPECIAL_NUMERIC) ? "SNUM" :
                       (flex->Decode.type == FLEX_PAGETYPE_NUMBERED_NUMERIC) ? "NNUM" : "NUM";
     const char *frag_str;
-    if (cont == 0 && frag == 3) frag_str = "complete";
-    else if (cont == 1)         frag_str = "fragment";
-    else                        frag_str = "fragment_end";
+    /* Numeric messages cannot be fragmented (ARIB STD-43A Section 4.2). */
+    frag_str = "complete";
     cJSON *extra = NULL;
     if (num_special_format >= 0) {
       extra = cJSON_CreateObject();
@@ -1811,14 +1826,36 @@ static void parse_short_message(struct Flex_Next * flex, unsigned int * phaseptr
 
   switch (sub_type) {
   case 0: {
-    // t=00: Short Numeric Message
-    // Short addr: 3 BCD digits in d0-d11 (bits 9-20 of vector)
-    //   d0-d3 = digit a, d4-d7 = digit b, d8-d11 = digit c
-    // Long addr: 3 digits in 1st vector + 5 digits in 2nd vector = 8 digits
-    //   d12-d15 = digit d, d16-d19 = digit e, d20-d23 = digit f,
-    //   d24-d27 = digit g, d28-d31 = digit h, d32 = spare (0)
-    // Unused digit positions filled with space (0xC).
-    // If ALL digits are space, this is a pure tone-only alert.
+    // t=00: Short Numeric Message or Network ID
+    // When address is a Network Address (Section 3.9.2, Table 3.9.2-1 (1)):
+    //   d0-d4 = A0-A4 (Service Area Identifier)
+    //   d5-d7 = M0-M2 (Multiplier)
+    //   d8-d11 = F0-F3 (Traffic Management Flags)
+    // When address is other than Network (Table 3.9.2-1 (2)):
+    //   Short addr: 3 BCD digits in d0-d11
+    //   Long addr: 3 digits in 1st vector + 5 digits in 2nd vector = 8 digits
+    if (flex->Decode.addr_type == 'N') {
+      unsigned int area_id = (phaseptr[j] >> 9) & 0x1F;
+      unsigned int multiplier = (phaseptr[j] >> 14) & 0x07;
+      unsigned int tmf = (phaseptr[j] >> 17) & 0x0F;
+      if (!json_mode) {
+        verbprintf(0, "SMSG|NID area=%u mult=%u tmf=0x%X", area_id, multiplier, tmf);
+      } else {
+        cJSON *extra = cJSON_CreateObject();
+        cJSON_AddStringToObject(extra, "smsg_sub_type", "network_id");
+        cJSON_AddNumberToObject(extra, "area_id", area_id);
+        cJSON_AddNumberToObject(extra, "multiplier", multiplier);
+        cJSON_AddNumberToObject(extra, "tmf", tmf);
+        char nid_msg[64];
+        snprintf(nid_msg, sizeof(nid_msg), "NID area=%u mult=%u tmf=0x%X", area_id, multiplier, tmf);
+        flex_next_json_emit(flex, flex->Decode.phase, flex->Decode.capcode, flex->Decode.addr_type,
+                            0, FLEX_PAGETYPE_SHORT_MESSAGE, "SMSG", "complete",
+                            -1, -1, -1, -1, -1, nid_msg, NULL, 0, extra);
+      }
+      break;
+    }
+
+    // Non-network: Short Numeric Message
     char digits[9];
     int ndigits = 0;
     int all_space = 1;
@@ -2159,7 +2196,7 @@ static void parse_binary(struct Flex_Next * flex, unsigned int * phaseptr, int *
       verbprintf(0, "%s", hex);
     } else {
       flex_next_json_emit(flex, flex->Decode.phase, flex->Decode.capcode, flex->Decode.addr_type,
-                          0, flex->Decode.type, "HEX", is_initial_hex ? "fragment_start" : "fragment",
+                          0, flex->Decode.type, "HEX", is_initial_hex ? "fragment_start" : "fragment_orphan",
                           msg_n, msg_r, msg_m, -1,
                           hex_sig_fail ? 0 : (hex_has_sig ? 1 : -1),
                           hex, NULL, 0, NULL);
@@ -3760,16 +3797,14 @@ static void flex_sym(struct Flex_Next * flex, unsigned char sym) {
           int boundary = (int)s2_symbols;  // default: nominal (blind count)
 
           // Decision logic:
-          // 1. Both C and inv.C found with matching gap → high confidence correction
-          // 2. Only one found → correct from that one (C at s2_half, inv.C at s2_symbols)
-          // 3. Neither → blind count
-          int correction = 0;
+          // 1. Both C and inv.C found with matching gap -> high confidence correction
+          // 2. Only one found -> correct from that one (C at s2_half, inv.C at s2_symbols)
+          // 3. Neither -> blind count
           if (flex->State.sync2_c_found && flex->State.sync2_cinv_found) {
             int gap = flex->State.sync2_cinv_pos - flex->State.sync2_c_pos;
             int offset = flex->State.sync2_cinv_pos - (int)s2_symbols;
             if (gap == (int)s2_half && offset != 0 && offset >= -2 && offset <= 2) {
               boundary = flex->State.sync2_cinv_pos;
-              correction = offset;
               verbprintf(2, "FLEX_NEXT: S2 boundary correction: %+d (C@%d(%de) inv.C@%d(%de) gap=%d)\n",
                          offset, flex->State.sync2_c_pos, flex->State.sync2_c_errs,
                          flex->State.sync2_cinv_pos, flex->State.sync2_cinv_errs, gap);
@@ -3779,7 +3814,6 @@ static void flex_sym(struct Flex_Next * flex, unsigned char sym) {
             int offset = flex->State.sync2_cinv_pos - (int)s2_symbols;
             if (offset != 0 && offset >= -1 && offset <= 1) {
               boundary = flex->State.sync2_cinv_pos;
-              correction = offset;
               verbprintf(2, "FLEX_NEXT: S2 boundary correction from inv.C: %+d (inv.C@%d(%de))\n",
                          offset, flex->State.sync2_cinv_pos, flex->State.sync2_cinv_errs);
             }
@@ -3788,7 +3822,6 @@ static void flex_sym(struct Flex_Next * flex, unsigned char sym) {
             int offset = flex->State.sync2_c_pos - (int)s2_half;
             if (offset != 0 && offset >= -1 && offset <= 1) {
               boundary = (int)s2_symbols + offset;
-              correction = offset;
               verbprintf(2, "FLEX_NEXT: S2 boundary correction from C: %+d (C@%d(%de))\n",
                          offset, flex->State.sync2_c_pos, flex->State.sync2_c_errs);
             }
