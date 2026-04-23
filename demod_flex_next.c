@@ -3874,59 +3874,53 @@ static void flex_sym(struct Flex_Next * flex, unsigned char sym) {
           }
         }
 
-        // End of scan window — make the boundary decision.
-        if (flex->State.sync2_count >= s2_symbols + 2) {
-          int boundary = (int)s2_symbols;  // default: nominal (blind count)
+        // End of S2 period — decide boundary and transition to DATA.
+        // Check at s2_symbols (nominal) and also handle early boundary.
+        {
+          int boundary = -1;  // -1 = not decided yet
 
-          // Decision logic:
-          // 1. Both C and inv.C found with matching gap -> high confidence correction
-          // 2. Only one found -> correct from that one (C at s2_half, inv.C at s2_symbols)
-          // 3. Neither -> blind count
-          if (flex->State.sync2_c_found && flex->State.sync2_cinv_found) {
-            int gap = flex->State.sync2_cinv_pos - flex->State.sync2_c_pos;
-            int offset = flex->State.sync2_cinv_pos - (int)s2_symbols;
-            if (gap == (int)s2_half && offset != 0 && offset >= -2 && offset <= 2) {
-              boundary = flex->State.sync2_cinv_pos;
-              verbprintf(2, "FLEX_NEXT: S2 boundary correction: %+d (C@%d(%de) inv.C@%d(%de) gap=%d)\n",
-                         offset, flex->State.sync2_c_pos, flex->State.sync2_c_errs,
-                         flex->State.sync2_cinv_pos, flex->State.sync2_cinv_errs, gap);
-            }
-          } else if (flex->State.sync2_cinv_found) {
-            // inv.C found alone — correct from inv.C position
-            int offset = flex->State.sync2_cinv_pos - (int)s2_symbols;
-            if (offset != 0 && offset >= -1 && offset <= 1) {
-              boundary = flex->State.sync2_cinv_pos;
-              verbprintf(2, "FLEX_NEXT: S2 boundary correction from inv.C: %+d (inv.C@%d(%de))\n",
-                         offset, flex->State.sync2_cinv_pos, flex->State.sync2_cinv_errs);
-            }
-          } else if (flex->State.sync2_c_found) {
-            // C found alone — correct from C position
-            int offset = flex->State.sync2_c_pos - (int)s2_half;
-            if (offset != 0 && offset >= -1 && offset <= 1) {
-              boundary = (int)s2_symbols + offset;
-              verbprintf(2, "FLEX_NEXT: S2 boundary correction from C: %+d (C@%d(%de))\n",
-                         offset, flex->State.sync2_c_pos, flex->State.sync2_c_errs);
-            }
-          } else {
-            verbprintf(3, "FLEX_NEXT: S2 neither C nor inv.C detected, using blind count (%u symbols)\n",
-                       s2_symbols);
-          }
-
-          // Transition to DATA
-          flex->State.data_count = 0;
-          clear_phase_data(flex);
-          flex->State.Current=FLEX_STATE_DATA;
-
-          // Replay buffered symbols that fall at or after the boundary.
-          {
-            int k;
-            for (k = 0; k < flex->State.sync2_sym_buf_count; k++) {
-              int sym_pos = flex->State.sync2_sym_buf_start + k;
-              if (sym_pos >= boundary) {
-                read_data(flex, flex->State.sync2_sym_buf[k]);
-                flex->State.data_count++;
+          // At s2_symbols - 1: check if early boundary detected
+          if (flex->State.sync2_count == s2_symbols - 1) {
+            if (flex->State.sync2_c_found && flex->State.sync2_cinv_found) {
+              int gap = flex->State.sync2_cinv_pos - flex->State.sync2_c_pos;
+              int offset = flex->State.sync2_cinv_pos - (int)s2_symbols;
+              if (gap == (int)s2_half && offset == -1) {
+                boundary = (int)s2_symbols - 1;
+                verbprintf(3, "FLEX_NEXT: S2 boundary correction: -1 (C@%d(%de) inv.C@%d(%de) gap=%d)\n",
+                           flex->State.sync2_c_pos, flex->State.sync2_c_errs,
+                           flex->State.sync2_cinv_pos, flex->State.sync2_cinv_errs, gap);
+              }
+            } else if (flex->State.sync2_c_found && flex->State.sync2_c_errs <= 1) {
+              // C-only (no inv.C confirmation): only trust with <= 1 error.
+              // At 2 errors the C pattern can match by coincidence on nominal
+              // boundary frames, causing a false -1 shift that swaps phases.
+              int offset = flex->State.sync2_c_pos - (int)s2_half;
+              if (offset == -1) {
+                boundary = (int)s2_symbols - 1;
+                verbprintf(3, "FLEX_NEXT: S2 boundary correction from C: -1 (C@%d(%de))\n",
+                           flex->State.sync2_c_pos, flex->State.sync2_c_errs);
               }
             }
+          }
+
+          // At s2_symbols: nominal boundary (if not already transitioned early)
+          if (flex->State.sync2_count == s2_symbols && flex->State.Current == FLEX_STATE_SYNC2) {
+            boundary = (int)s2_symbols;
+            if (!flex->State.sync2_c_found && !flex->State.sync2_cinv_found) {
+              verbprintf(3, "FLEX_NEXT: S2 no C/inv.C detected, using blind count (%u symbols)\n",
+                         s2_symbols);
+            }
+          }
+
+          if (boundary >= 0) {
+            verbprintf(3, "FLEX_NEXT: S2 boundary: offset=%+d C:%s inv.C:%s\n",
+                       boundary - (int)s2_symbols,
+                       flex->State.sync2_c_found ? "yes" : "no",
+                       flex->State.sync2_cinv_found ? "yes" : "no");
+
+            flex->State.data_count = 0;
+            clear_phase_data(flex);
+            flex->State.Current = FLEX_STATE_DATA;
           }
         }
 
@@ -3934,10 +3928,41 @@ static void flex_sym(struct Flex_Next * flex, unsigned char sym) {
       }
     case FLEX_STATE_DATA:
       {
-        // The data portion of the frame is 1760 ms long at either
-        // baudrate.  This is 2816 bits @ 1600 bps and 5632 bits @ 3200 bps.
-        // The output_symbol() routine decodes and doles out the bits
-        // to each of the four transmitted phases of FLEX interleaved codes.
+        // Continue S2 inv.C correlation for first 2 DATA symbols
+        // to detect late S2 boundary and correct for it.
+        if (flex->State.data_count < 2 && !flex->State.sync2_cinv_found) {
+          flex->State.sync2_count++;
+          int bit_a = (sym_rectified > 1);
+          if (flex->Sync.levels == 4) {
+            int bit_b = (sym_rectified == 1) || (sym_rectified == 2);
+            flex->State.sync2_shiftreg = (uint16_t)(
+              (flex->State.sync2_shiftreg << 2) | (bit_a << 1) | bit_b);
+          } else {
+            flex->State.sync2_shiftreg = (uint16_t)(
+              (flex->State.sync2_shiftreg << 1) | bit_a);
+          }
+          unsigned int bits_per_sym = (flex->Sync.levels == 4) ? 2 : 1;
+          unsigned int c_sym_len = 16 / bits_per_sym;
+          if (flex->State.sync2_count >= c_sym_len) {
+            unsigned int cinv_errs = count_bits(flex, flex->State.sync2_shiftreg ^ FLEX_S2_C_INV);
+            if (cinv_errs <= 2) {
+              unsigned int s2_symbols = flex->Sync.baud*25/1000;
+              int late_offset = (int)flex->State.sync2_count - (int)s2_symbols;
+              flex->State.sync2_cinv_found = 1;
+              flex->State.sync2_cinv_pos = flex->State.sync2_count;
+              flex->State.sync2_cinv_errs = (int)cinv_errs;
+              verbprintf(3, "FLEX_NEXT: S2 late inv.C at symbol %u/%u (%ue), correcting +%d: reset phase data\n",
+                         flex->State.sync2_count, s2_symbols, cinv_errs, late_offset);
+              // The first data_count symbols were actually S2 tail.
+              // Reset phase data and data_count so DATA starts fresh
+              // from the next symbol (the real first DATA symbol).
+              clear_phase_data(flex);
+              flex->State.data_count = 0;
+              break;  // don't feed this symbol to read_data
+            }
+          }
+        }
+
         int idle = 0;
         idle = read_data(flex, sym_rectified);
         if (++flex->State.data_count == flex->Sync.baud*1760/1000 || idle) {
