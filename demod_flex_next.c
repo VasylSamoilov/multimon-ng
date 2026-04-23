@@ -160,8 +160,8 @@ extern int json_mode;
 #define REPORT_GROUP_CODES   1       // Report each cleared faulty group capcode : 0 = Each on a new line; 1 = All on the same line;
 
 #define FLEX_SYNC_MARKER     0xA6C6AAAAul  // Synchronisation code marker for FLEX
-#define SLICE_THRESHOLD      0.6659        // 4-level quantization threshold (optimized from 2/3)
-#define SLICE_THRESHOLD_IAD  0.665         // Integrate-and-dump alternate slicer threshold
+#define SLICE_THRESHOLD      0.667         // For 4 level code, levels 0 and 3 have 3 times the amplitude of levels 1 and 2, so quantise at 2/3
+#define SLICE_THRESHOLD_IAD  0.667         // Integrate-and-dump alternate slicer threshold
 #define DC_OFFSET_FILTER     0.010         // DC Offset removal IIR filter response (seconds)
 #define PHASE_LOCKED_RATE    0.045         // Correction factor for locked state
 #define PHASE_UNLOCKED_RATE  0.050         // Correction factor for unlocked state
@@ -1633,10 +1633,10 @@ group_output:
 // Implemented bierviltje code from ticket: https://github.com/EliasOenal/multimon-ng/issues/123# 
         if(flex_groupmessage == 1) {
                 int endpoint = flex->GroupHandler.GroupCodes[flex_groupbit][CAPCODES_INDEX];
-                // Debug logging AFTER the level-0 line is complete
+                // Debug logging - group capcodes are already in the cap_field of the output line
                 for(int g = 1; g <= endpoint;g++)
                 {
-                        verbprintf(1, "FLEX Group message output: Groupbit: %i Total Capcodes; %i; index %i; Capcode: [%010" PRId64 "]\n", flex_groupbit, endpoint, g, flex->GroupHandler.GroupCodes[flex_groupbit][g]);
+                        verbprintf(3, "FLEX_NEXT: Group message: Groupbit: %i Total Capcodes; %i; index %i; Capcode: [%010" PRId64 "]\n", flex_groupbit, endpoint, g, flex->GroupHandler.GroupCodes[flex_groupbit][g]);
                 }
 
                 // reset the value
@@ -2640,46 +2640,29 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
   // that passes the checksum.  Words beyond that are not real vectors
   // - the addresses that would pair with them are tone-only.
   //
-  // IMPORTANT: BCH-uncorrectable vector words are treated as
-  // potentially valid (not counted as checksum failures).  Only
-  // BCH-clean words that FAIL the checksum prove there is no real
-  // vector at that slot.  This avoids misclassifying real messages
-  // as tone-only when a vector word is temporarily corrupted.
-  //
-  // n_valid_vecs = index+1 of the last slot that is either
-  // BCH-uncorrectable OR passes the checksum.
+  // NOTE: The nibble checksum can fail on valid vectors after BCH
+  // correction or I&D merge substitution.  To avoid false tone-only
+  // classification, we treat ALL vector slots as valid and only log
+  // checksum failures for diagnostics.  This matches FLEX behavior.
   int n_valid_vecs;
   {
     int max_vec = (int)(voffset - aoffset);
     if (max_vec > (int)((unsigned)PHASE_WORDS - voffset))
       max_vec = (int)((unsigned)PHASE_WORDS - voffset);
-    int last_valid = -1;
+
+    // Log checksum failures for diagnostics but don't reject vectors
     for (int vi = 0; vi < max_vec; vi++) {
       int wi = (int)voffset + vi;
-      if (bch_err[wi]) {
-        // Can't verify - assume valid to avoid dropping real messages
-        last_valid = vi;
-        continue;
-      }
+      if (bch_err[wi]) continue;
       uint32_t vw = phaseptr[wi];
-      // Check vector type first: Short Instruction vectors (V=001)
-      // use a different field layout where bits 7-20 carry instruction
-      // data, not message word pointers.  The 4-bit nibble checksum
-      // (Section 3.5.1) does NOT apply to instruction vectors - the
-      // checksum field (bits 0-3) is part of the instruction encoding.
-      // Always treat instruction vectors as valid.
       int vtype = (vw >> 4) & 0x7;
-      if (vtype == FLEX_PAGETYPE_SHORT_INSTRUCTION) {
-        last_valid = vi;
-        continue;
-      }
+      if (vtype == FLEX_PAGETYPE_SHORT_INSTRUCTION) continue;
       uint32_t csum = (vw & 0xF) + ((vw >> 4) & 0xF) + ((vw >> 8) & 0xF) +
                       ((vw >> 12) & 0xF) + ((vw >> 16) & 0xF) + ((vw >> 20) & 0x1);
-      if ((csum & 0xF) == 0xF)
-        last_valid = vi;
-      // else: BCH-clean but checksum fails - not a real vector
+      if ((csum & 0xF) != 0xF)
+        verbprintf(3, "FLEX_NEXT: Vector word %d checksum fail (0x%05X csum=0x%X), treating as valid\n", wi, vw, csum & 0xF);
     }
-    n_valid_vecs = last_valid + 1;
+    n_valid_vecs = max_vec;
   }
 
   // Track how many vector slots have been consumed.
@@ -3459,6 +3442,80 @@ static void decode_data(struct Flex_Next * flex) {
     frag_expire(flex, abs_frame);
   }
 
+  // I&D merge: substitute alt words into primary where alt BCH succeeds
+  // but primary fails. Applied to all active phases for all modes.
+  {
+    struct { struct Flex_Phase *pri; struct Flex_Phase *alt; char name; } pairs[4];
+    int npairs = 0;
+
+    // Determine active phases based on mode
+    if (flex->Sync.baud == 1600) {
+      if (flex->Sync.levels == 2) {
+        // A1: Phase A only
+        pairs[0] = (typeof(pairs[0])){ &flex->Data.PhaseA, &flex->Data.AltA, 'A' };
+        npairs = 1;
+      } else {
+        // A3: Phase A + Phase C
+        pairs[0] = (typeof(pairs[0])){ &flex->Data.PhaseA, &flex->Data.AltA, 'A' };
+        pairs[1] = (typeof(pairs[0])){ &flex->Data.PhaseC, &flex->Data.AltC, 'C' };
+        npairs = 2;
+      }
+    } else {
+      if (flex->Sync.levels == 2) {
+        // A2: Phase A + Phase C
+        pairs[0] = (typeof(pairs[0])){ &flex->Data.PhaseA, &flex->Data.AltA, 'A' };
+        pairs[1] = (typeof(pairs[0])){ &flex->Data.PhaseC, &flex->Data.AltC, 'C' };
+        npairs = 2;
+      } else {
+        // A4: Phase A + B + C + D
+        pairs[0] = (typeof(pairs[0])){ &flex->Data.PhaseA, &flex->Data.AltA, 'A' };
+        pairs[1] = (typeof(pairs[0])){ &flex->Data.PhaseB, &flex->Data.AltB, 'B' };
+        pairs[2] = (typeof(pairs[0])){ &flex->Data.PhaseC, &flex->Data.AltC, 'C' };
+        pairs[3] = (typeof(pairs[0])){ &flex->Data.PhaseD, &flex->Data.AltD, 'D' };
+        npairs = 4;
+      }
+    }
+
+    int improved = 0;
+    for (int p = 0; p < npairs; p++) {
+      /* Parse BIW from primary to find frame structure. */
+      uint32_t biw_tmp = pairs[p].pri->buf[0];
+      int biw_ok = (bch3121_fix_errors(flex, &biw_tmp, pairs[p].name) >= 0);
+      unsigned int voffset = PHASE_WORDS;
+      unsigned int aoffset_val = 1;
+      if (biw_ok) {
+        biw_tmp &= 0x1FFFFFL;
+        voffset = (biw_tmp >> 10) & 0x3fL;
+        aoffset_val = ((biw_tmp >> 8) & 0x3L) + 1;
+        if (voffset == 0) voffset = PHASE_WORDS;
+      }
+
+      for (unsigned int w = 0; w < PHASE_WORDS; w++) {
+        uint32_t alt_word = pairs[p].alt->buf[w];
+        int alt_rc = bch3121_fix_errors(flex, &alt_word, pairs[p].name);
+        uint32_t pri_word = pairs[p].pri->buf[w];
+        int pri_rc = bch3121_fix_errors(flex, &pri_word, pairs[p].name);
+
+        /* Safe regions (BIW + body): substitute if alt BCH succeeds */
+        if (pri_rc != 0 && alt_rc >= 0 && (w < aoffset_val || w >= voffset)) {
+          pairs[p].pri->buf[w] = pairs[p].alt->buf[w];
+          improved++;
+        }
+        /* Address/vector words: substitute only with perfect BCH and
+         * single-bit raw word distance (safest recovery). */
+        else if (pri_rc != 0 && alt_rc == 0 && w >= aoffset_val && w < voffset) {
+          int ndiff = __builtin_popcount(pairs[p].pri->buf[w] ^ pairs[p].alt->buf[w]);
+          if (ndiff <= 1) {
+            pairs[p].pri->buf[w] = pairs[p].alt->buf[w];
+            improved++;
+          }
+        }
+      }
+    }
+    if (improved)
+      verbprintf(3, "FLEX_NEXT: I&D merge improved %d words\n", improved);
+  }
+
   // Phase decode per ARIB STD-43A Section 3.3:
   //   A1 (1600/2FSK): Phase A only
   //   A3 (1600/4FSK): Phase A + Phase C
@@ -3476,61 +3533,6 @@ static void decode_data(struct Flex_Next * flex) {
       decode_phase(flex, 'A');
       decode_phase(flex, 'C');
     } else {
-      /* 3200/4FSK: BCH-decode alternate buffers, then substitute
-       * alt words into primary where alt BCH succeeds but primary
-       * would fail. Primary BCH happens inside decode_phase. */
-      {
-        struct { struct Flex_Phase *pri; struct Flex_Phase *alt; } pairs[] = {
-          { &flex->Data.PhaseA, &flex->Data.AltA },
-          { &flex->Data.PhaseB, &flex->Data.AltB },
-          { &flex->Data.PhaseC, &flex->Data.AltC },
-          { &flex->Data.PhaseD, &flex->Data.AltD },
-        };
-        char phase_names[] = "ABCD";
-
-        int improved = 0;
-        for (int p = 0; p < 4; p++) {
-          /* Parse BIW from primary to find frame structure. */
-          uint32_t biw_tmp = pairs[p].pri->buf[0];
-          int biw_ok = (bch3121_fix_errors(flex, &biw_tmp, phase_names[p]) >= 0);
-          unsigned int voffset = PHASE_WORDS;
-          unsigned int aoffset_val = 1;
-          if (biw_ok) {
-            biw_tmp &= 0x1FFFFFL;
-            voffset = (biw_tmp >> 10) & 0x3fL;
-            aoffset_val = ((biw_tmp >> 8) & 0x3L) + 1;
-            if (voffset == 0) voffset = PHASE_WORDS;
-          }
-
-          /* Substitute safe regions: BIW region (< aoffset) + body (>= voffset).
-           * Address words (aoffset to voffset-1) are skipped to preserve
-           * frame parsing integrity. When primary BIW is uncorrectable,
-           * voffset=PHASE_WORDS and aoffset=1, so only word 0 (BIW) is
-           * substituted — this recovers the phase for decode_phase. */
-          for (unsigned int w = 0; w < PHASE_WORDS; w++) {
-            uint32_t alt_word = pairs[p].alt->buf[w];
-            int alt_rc = bch3121_fix_errors(flex, &alt_word, phase_names[p]);
-            uint32_t pri_word = pairs[p].pri->buf[w];
-            int pri_rc = bch3121_fix_errors(flex, &pri_word, phase_names[p]);
-
-            if (pri_rc != 0 && alt_rc >= 0 && (w < aoffset_val || w >= voffset)) {
-              pairs[p].pri->buf[w] = pairs[p].alt->buf[w];
-              improved++;
-            }
-            /* Address words: substitute only with perfect BCH and
-             * single-bit raw word distance (safest recovery). */
-            else if (pri_rc != 0 && alt_rc == 0 && w >= aoffset_val && w < voffset) {
-              int ndiff = __builtin_popcount(pairs[p].pri->buf[w] ^ pairs[p].alt->buf[w]);
-              if (ndiff <= 1) {
-                pairs[p].pri->buf[w] = pairs[p].alt->buf[w];
-                improved++;
-              }
-            }
-          }
-        }
-        if (improved)
-          verbprintf(3, "FLEX_NEXT: I&D merge improved %d words\n", improved);
-      }
       decode_phase(flex, 'A');
       decode_phase(flex, 'B');
       decode_phase(flex, 'C');
@@ -3907,6 +3909,13 @@ static int buildSymbol(struct Flex_Next * flex, double sample) {
                 if (flex->State.Current == FLEX_STATE_SYNC1) {
                         flex->Demodulator.envelope_sum += fabs(sample);
                         flex->Demodulator.envelope_count++;
+                        /* Cap the averaging window to prevent infinite accumulation.
+                         * Halve both sum and count when limit reached so older samples
+                         * decay while maintaining a smooth average. */
+                        if (flex->Demodulator.envelope_count > FREQ_SAMP * 2) {
+                                flex->Demodulator.envelope_sum /= 2.0;
+                                flex->Demodulator.envelope_count /= 2;
+                        }
                         flex->Modulation.envelope = flex->Demodulator.envelope_sum / flex->Demodulator.envelope_count;
                 }
         }
@@ -4032,21 +4041,25 @@ static void Flex_Demodulate(struct Flex_Next * flex, double sample) {
     flex->Demodulator.sym_sum = 0;
     flex->Demodulator.sym_n = 0;
 
-    /* Feed alternate symbols into AltA/B/C/D during data.
-     * Both bit_a and bit_b may differ between vote and I&D. */
-    if (flex->Demodulator.locked && flex->State.Current == FLEX_STATE_DATA
-        && flex->Sync.levels == 4 && flex->Sync.baud == 3200) {
-      /* Use I&D's own bit_a and bit_b for alternate phase buffers. */
+    /* Feed alternate I&D symbols into AltA/B/C/D during data for all modes.
+     * Mirrors the read_data() phase mapping using the I&D slicer output. */
+    if (flex->Demodulator.locked && flex->State.Current == FLEX_STATE_DATA) {
       int alt_bit_a = (alt_symbol > 1);
       int alt_bit_b = (alt_symbol == 1) || (alt_symbol == 2);
       unsigned int idx = ((flex->Data.data_bit_counter>>5)&0xFFF8) | (flex->Data.data_bit_counter&0x0007);
       if (idx < PHASE_WORDS) {
         if (flex->Data.phase_toggle == 0) {
-          /* Even symbol: bit_a -> AltA, bit_b -> AltB */
+          /* At 1600 baud: every symbol. At 3200 baud: even symbols. */
           flex->Data.AltA.buf[idx] = (flex->Data.AltA.buf[idx]>>1) | (alt_bit_a?(0x80000000):0);
-          flex->Data.AltB.buf[idx] = (flex->Data.AltB.buf[idx]>>1) | (alt_bit_b?(0x80000000):0);
+          if (flex->Sync.baud == 1600) {
+            /* 1600/4FSK: bit_b -> AltC (same as read_data PhaseC mapping) */
+            flex->Data.AltC.buf[idx] = (flex->Data.AltC.buf[idx]>>1) | (alt_bit_b?(0x80000000):0);
+          } else {
+            /* 3200/4FSK: bit_b -> AltB */
+            flex->Data.AltB.buf[idx] = (flex->Data.AltB.buf[idx]>>1) | (alt_bit_b?(0x80000000):0);
+          }
         } else {
-          /* Odd symbol: bit_a -> AltC, bit_b -> AltD */
+          /* 3200 baud only: odd symbols -> AltC, AltD */
           flex->Data.AltC.buf[idx] = (flex->Data.AltC.buf[idx]>>1) | (alt_bit_a?(0x80000000):0);
           flex->Data.AltD.buf[idx] = (flex->Data.AltD.buf[idx]>>1) | (alt_bit_b?(0x80000000):0);
         }
