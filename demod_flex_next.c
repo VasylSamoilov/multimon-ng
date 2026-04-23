@@ -467,6 +467,12 @@ struct Flex_Next {
   struct Flex_DedupStore     DedupStore;
   int                         biw_sysmsg_a_type;  // BIW101 A-type (-1 = not present)
   struct Flex_OTA_Time        ota_time;            // Last known good OTA time
+  /* BER statistics */
+  unsigned long               bch_words_0err;     // words with 0 errors
+  unsigned long               bch_words_1err;     // words with 1 bit error (corrected)
+  unsigned long               bch_words_2err;     // words with 2 bit errors (corrected)
+  unsigned long               bch_words_uncorr;   // words with 3+ errors (uncorrectable)
+  unsigned long               bch_phases;         // phases decoded
 };
 
 
@@ -714,11 +720,11 @@ static int bch3121_fix_errors(struct Flex_Next * flex, uint32_t * data_to_fix, c
 
     /*Write the fixed data back to the caller*/
     *data_to_fix = data;
-    return 0;
+    return result;  /* 0=clean, 1=1-bit fix, 2=2-bit fix */
 
   } else {
     verbprintf(3, "FLEX_NEXT: Phase %c Data corruption - Unable to fix errors.\n", PhaseNo);
-    return 1;
+    return -1;
   }
 }
 
@@ -822,7 +828,7 @@ static int decode_fiw(struct Flex_Next * flex) {
   unsigned int fiw = flex->FIW.rawdata;
   int decode_error = bch3121_fix_errors(flex, &fiw, 'F');
 
-  if (decode_error) {
+  if (decode_error < 0) {
     verbprintf(3, "FLEX_NEXT: Unable to decode FIW, too much data corruption\n");
     return 1;
   }
@@ -2309,11 +2315,13 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
   }
 
   // BCH decode all 88 words first
+  flex->bch_phases++;
   for (unsigned int i = 0; i < PHASE_WORDS; i++) {
-    int decode_error=bch3121_fix_errors(flex, &phaseptr[i], PhaseNo);
+    int bch_rc=bch3121_fix_errors(flex, &phaseptr[i], PhaseNo);
 
-    if (decode_error) {
+    if (bch_rc < 0) {
       verbprintf(3, "FLEX_NEXT: BCH error at word %u (phase %c), marking uncorrectable\n", i, PhaseNo);
+      flex->bch_words_uncorr++;
 
       switch (PhaseNo) {
         case 'A': flex->Data.PhaseA.bch_err[i]=1; break;
@@ -2323,6 +2331,10 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
       }
       continue;
     }
+
+    if (bch_rc == 0) flex->bch_words_0err++;
+    else if (bch_rc == 1) flex->bch_words_1err++;
+    else if (bch_rc == 2) flex->bch_words_2err++;
 
     phaseptr[i]&=0x1FFFFFL;
   }
@@ -3497,13 +3509,13 @@ static void decode_data(struct Flex_Next * flex) {
         int pri_rc = bch3121_fix_errors(flex, &pri_word, pairs[p].name);
 
         /* Safe regions (BIW + body): substitute if alt BCH succeeds */
-        if (pri_rc != 0 && alt_rc >= 0 && (w < aoffset_val || w >= voffset)) {
+        if (pri_rc < 0 && alt_rc >= 0 && (w < aoffset_val || w >= voffset)) {
           pairs[p].pri->buf[w] = pairs[p].alt->buf[w];
           improved++;
         }
         /* Address/vector words: substitute only with perfect BCH and
          * single-bit raw word distance (safest recovery). */
-        else if (pri_rc != 0 && alt_rc == 0 && w >= aoffset_val && w < voffset) {
+        else if (pri_rc < 0 && alt_rc == 0 && w >= aoffset_val && w < voffset) {
           int ndiff = __builtin_popcount(pairs[p].pri->buf[w] ^ pairs[p].alt->buf[w]);
           if (ndiff <= 1) {
             pairs[p].pri->buf[w] = pairs[p].alt->buf[w];
@@ -4108,6 +4120,27 @@ static void Flex_Demodulate(struct Flex_Next * flex, double sample) {
 
 static void Flex_Delete(struct Flex_Next * flex) {
   if (flex==NULL) return;
+
+  /* Print BER statistics summary */
+  unsigned long total = flex->bch_words_0err + flex->bch_words_1err +
+                        flex->bch_words_2err + flex->bch_words_uncorr;
+  if (total > 0) {
+    unsigned long err_bits = flex->bch_words_1err * 1 +
+                             flex->bch_words_2err * 2 +
+                             flex->bch_words_uncorr * 3;
+    unsigned long total_bits = total * 31;
+    double ber = (double)err_bits / total_bits;
+    double wer = (double)(flex->bch_words_1err + flex->bch_words_2err + flex->bch_words_uncorr) / total;
+    verbprintf(0, "FLEX_NEXT: BER Statistics:\n");
+    verbprintf(0, "FLEX_NEXT:   Phases decoded:  %lu\n", flex->bch_phases);
+    verbprintf(0, "FLEX_NEXT:   BCH words total: %lu\n", total);
+    verbprintf(0, "FLEX_NEXT:   0-err (clean):   %lu (%.2f%%)\n", flex->bch_words_0err, 100.0*flex->bch_words_0err/total);
+    verbprintf(0, "FLEX_NEXT:   1-err (fixed):   %lu (%.2f%%)\n", flex->bch_words_1err, 100.0*flex->bch_words_1err/total);
+    verbprintf(0, "FLEX_NEXT:   2-err (fixed):   %lu (%.3f%%)\n", flex->bch_words_2err, 100.0*flex->bch_words_2err/total);
+    verbprintf(0, "FLEX_NEXT:   3+err (uncorr):  %lu (%.4f%%)\n", flex->bch_words_uncorr, 100.0*flex->bch_words_uncorr/total);
+    verbprintf(0, "FLEX_NEXT:   WER: %.6f  BER: %.6f\n", wer, ber);
+  }
+
   free(flex);
 }
 
