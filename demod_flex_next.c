@@ -285,6 +285,11 @@ struct Flex_Phase {
   unsigned int                buf[PHASE_WORDS];
   int                         bch_err[PHASE_WORDS]; // 0=ok, 1=uncorrectable
   int                         idle_count;
+  /* Per-phase BCH stats (reset each frame) */
+  int                         bch_0err;
+  int                         bch_1err;
+  int                         bch_2err;
+  int                         bch_uncorr;
 };
 
 
@@ -467,12 +472,6 @@ struct Flex_Next {
   struct Flex_DedupStore     DedupStore;
   int                         biw_sysmsg_a_type;  // BIW101 A-type (-1 = not present)
   struct Flex_OTA_Time        ota_time;            // Last known good OTA time
-  /* BER statistics */
-  unsigned long               bch_words_0err;     // words with 0 errors
-  unsigned long               bch_words_1err;     // words with 1 bit error (corrected)
-  unsigned long               bch_words_2err;     // words with 2 bit errors (corrected)
-  unsigned long               bch_words_uncorr;   // words with 3+ errors (uncorrectable)
-  unsigned long               bch_phases;         // phases decoded
 };
 
 
@@ -2315,26 +2314,41 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
   }
 
   // BCH decode all 88 words first
-  flex->bch_phases++;
+  // Reset per-phase BCH counters
+  {
+    struct Flex_Phase *ph = NULL;
+    switch (PhaseNo) {
+      case 'A': ph = &flex->Data.PhaseA; break;
+      case 'B': ph = &flex->Data.PhaseB; break;
+      case 'C': ph = &flex->Data.PhaseC; break;
+      case 'D': ph = &flex->Data.PhaseD; break;
+    }
+    if (ph) { ph->bch_0err = 0; ph->bch_1err = 0; ph->bch_2err = 0; ph->bch_uncorr = 0; }
+  }
   for (unsigned int i = 0; i < PHASE_WORDS; i++) {
     int bch_rc=bch3121_fix_errors(flex, &phaseptr[i], PhaseNo);
 
     if (bch_rc < 0) {
       verbprintf(3, "FLEX_NEXT: BCH error at word %u (phase %c), marking uncorrectable\n", i, PhaseNo);
-      flex->bch_words_uncorr++;
 
       switch (PhaseNo) {
-        case 'A': flex->Data.PhaseA.bch_err[i]=1; break;
-        case 'B': flex->Data.PhaseB.bch_err[i]=1; break;
-        case 'C': flex->Data.PhaseC.bch_err[i]=1; break;
-        case 'D': flex->Data.PhaseD.bch_err[i]=1; break;
+        case 'A': flex->Data.PhaseA.bch_err[i]=1; flex->Data.PhaseA.bch_uncorr++; break;
+        case 'B': flex->Data.PhaseB.bch_err[i]=1; flex->Data.PhaseB.bch_uncorr++; break;
+        case 'C': flex->Data.PhaseC.bch_err[i]=1; flex->Data.PhaseC.bch_uncorr++; break;
+        case 'D': flex->Data.PhaseD.bch_err[i]=1; flex->Data.PhaseD.bch_uncorr++; break;
       }
       continue;
     }
 
-    if (bch_rc == 0) flex->bch_words_0err++;
-    else if (bch_rc == 1) flex->bch_words_1err++;
-    else if (bch_rc == 2) flex->bch_words_2err++;
+    if (bch_rc == 0) { /* clean word */ }
+    else if (bch_rc == 1) { /* 1-bit fix */ }
+    else if (bch_rc == 2) { /* 2-bit fix */ }
+    switch (PhaseNo) {
+      case 'A': if (bch_rc==0) flex->Data.PhaseA.bch_0err++; else if (bch_rc==1) flex->Data.PhaseA.bch_1err++; else flex->Data.PhaseA.bch_2err++; break;
+      case 'B': if (bch_rc==0) flex->Data.PhaseB.bch_0err++; else if (bch_rc==1) flex->Data.PhaseB.bch_1err++; else flex->Data.PhaseB.bch_2err++; break;
+      case 'C': if (bch_rc==0) flex->Data.PhaseC.bch_0err++; else if (bch_rc==1) flex->Data.PhaseC.bch_1err++; else flex->Data.PhaseC.bch_2err++; break;
+      case 'D': if (bch_rc==0) flex->Data.PhaseD.bch_0err++; else if (bch_rc==1) flex->Data.PhaseD.bch_1err++; else flex->Data.PhaseD.bch_2err++; break;
+    }
 
     phaseptr[i]&=0x1FFFFFL;
   }
@@ -2643,42 +2657,38 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
   int flex_groupmessage = 0;
   int flex_groupbit = 0;
 
-  // Pre-scan: count valid vector words using 4-bit nibble checksum
-  // (Section 3.5.1) to determine where tone-only addresses begin.
+  // Tone-only detection (Section 3.8.1(6)):
   //
-  // Tone-only addresses sit at the end of the address field with no
-  // corresponding vector word (Section 3.8.1(6)).  The vector field
-  // starts at voffset; we scan forward to find the last vector word
-  // that passes the checksum.  Words beyond that are not real vectors
-  // - the addresses that would pair with them are tone-only.
+  // Tone-only addresses sit at the END of the address field with NO
+  // corresponding vector word.  They are signaled by the transmitter
+  // by placing more addresses than vectors in the frame.
   //
-  // NOTE: The nibble checksum can fail on valid vectors after BCH
-  // correction or I&D merge substitution.  To avoid false tone-only
-  // classification, we treat ALL vector slots as valid and only log
-  // checksum failures for diagnostics.  This matches FLEX behavior.
+  // Previous approach used 4-bit nibble checksum on vector words to
+  // find where "real" vectors end and tone-only addresses begin.
+  // This was too aggressive — the checksum can fail on valid vectors
+  // after BCH correction or I&D merge substitution, causing false
+  // tone-only classification and lost messages.
+  //
+  // Correct tone-only detection criteria (all must be true):
+  //   1. The would-be vector word is idle fill (all-zeros 0x000000
+  //      or all-ones 0x1FFFFF after BCH), with BCH error count <= 1
+  //   2. ALL subsequent addresses (from this one to voffset-1) also
+  //      have idle-fill vector words meeting criterion 1
+  //   3. The address word itself passes BCH with error count <= 1
+  //
+  // This ensures we only classify as tone-only when we are certain
+  // the vector slot contains no real data.  Currently disabled —
+  // all vector slots are treated as valid (matches FLEX behavior).
+  // Tone-only pages are extremely rare on real networks (e.g. P2000).
   int n_valid_vecs;
   {
     int max_vec = (int)(voffset - aoffset);
     if (max_vec > (int)((unsigned)PHASE_WORDS - voffset))
       max_vec = (int)((unsigned)PHASE_WORDS - voffset);
-
-    // Log checksum failures for diagnostics but don't reject vectors
-    for (int vi = 0; vi < max_vec; vi++) {
-      int wi = (int)voffset + vi;
-      if (bch_err[wi]) continue;
-      uint32_t vw = phaseptr[wi];
-      int vtype = (vw >> 4) & 0x7;
-      if (vtype == FLEX_PAGETYPE_SHORT_INSTRUCTION) continue;
-      uint32_t csum = (vw & 0xF) + ((vw >> 4) & 0xF) + ((vw >> 8) & 0xF) +
-                      ((vw >> 12) & 0xF) + ((vw >> 16) & 0xF) + ((vw >> 20) & 0x1);
-      if ((csum & 0xF) != 0xF)
-        verbprintf(3, "FLEX_NEXT: Vector word %d checksum fail (0x%05X csum=0x%X), treating as valid\n", wi, vw, csum & 0xF);
-    }
     n_valid_vecs = max_vec;
   }
 
   // Track how many vector slots have been consumed.
-  // When vec_used reaches n_valid_vecs, remaining addresses are tone-only.
   unsigned int vec_used = 0;
 
   // Iterate through pages and dispatch to appropriate handler.
@@ -3405,6 +3415,47 @@ page_done:
       }
     }
   }
+
+  /* Per-phase BCH summary */
+  {
+    struct Flex_Phase *ph = NULL;
+    switch (PhaseNo) {
+      case 'A': ph = &flex->Data.PhaseA; break;
+      case 'B': ph = &flex->Data.PhaseB; break;
+      case 'C': ph = &flex->Data.PhaseC; break;
+      case 'D': ph = &flex->Data.PhaseD; break;
+    }
+    if (ph) {
+      int errbits = ph->bch_1err + ph->bch_2err * 2 + ph->bch_uncorr * 3;
+      if (!json_mode) {
+        verbprintf(1, "FLEX_NEXT|%i/%i|%02i.%03i.%c|BCH|%s|0:%d|1:%d|2:%d|U:%d|errbits:%d\n",
+                   flex->Sync.baud, flex->Sync.levels,
+                   flex->FIW.cycleno, flex->FIW.frameno, PhaseNo,
+                   flex->Sync.polarity ? "NEG" : "POS",
+                   ph->bch_0err, ph->bch_1err, ph->bch_2err, ph->bch_uncorr, errbits);
+      } else {
+        cJSON *json = cJSON_CreateObject();
+        if (json) {
+          cJSON_AddNumberToObject(json, "baud", flex->Sync.baud);
+          cJSON_AddNumberToObject(json, "level", flex->Sync.levels);
+          char phs[2] = { PhaseNo, '\0' };
+          cJSON_AddStringToObject(json, "phase", phs);
+          cJSON_AddNumberToObject(json, "cycle", flex->FIW.cycleno);
+          cJSON_AddNumberToObject(json, "frame", flex->FIW.frameno);
+          cJSON_AddStringToObject(json, "msg_type", "bch_stats");
+          cJSON_AddStringToObject(json, "polarity", flex->Sync.polarity ? "NEG" : "POS");
+          cJSON_AddNumberToObject(json, "bch_0err", ph->bch_0err);
+          cJSON_AddNumberToObject(json, "bch_1err", ph->bch_1err);
+          cJSON_AddNumberToObject(json, "bch_2err", ph->bch_2err);
+          cJSON_AddNumberToObject(json, "bch_uncorr", ph->bch_uncorr);
+          cJSON_AddNumberToObject(json, "errbits", errbits);
+          char *out = cJSON_PrintUnformatted(json);
+          if (out) { fprintf(stdout, "%s\n", out); free(out); }
+          cJSON_Delete(json);
+        }
+      }
+    }
+  }
 }
 
 
@@ -4120,27 +4171,6 @@ static void Flex_Demodulate(struct Flex_Next * flex, double sample) {
 
 static void Flex_Delete(struct Flex_Next * flex) {
   if (flex==NULL) return;
-
-  /* Print BER statistics summary */
-  unsigned long total = flex->bch_words_0err + flex->bch_words_1err +
-                        flex->bch_words_2err + flex->bch_words_uncorr;
-  if (total > 0) {
-    unsigned long err_bits = flex->bch_words_1err * 1 +
-                             flex->bch_words_2err * 2 +
-                             flex->bch_words_uncorr * 3;
-    unsigned long total_bits = total * 31;
-    double ber = (double)err_bits / total_bits;
-    double wer = (double)(flex->bch_words_1err + flex->bch_words_2err + flex->bch_words_uncorr) / total;
-    verbprintf(0, "FLEX_NEXT: BER Statistics:\n");
-    verbprintf(0, "FLEX_NEXT:   Phases decoded:  %lu\n", flex->bch_phases);
-    verbprintf(0, "FLEX_NEXT:   BCH words total: %lu\n", total);
-    verbprintf(0, "FLEX_NEXT:   0-err (clean):   %lu (%.2f%%)\n", flex->bch_words_0err, 100.0*flex->bch_words_0err/total);
-    verbprintf(0, "FLEX_NEXT:   1-err (fixed):   %lu (%.2f%%)\n", flex->bch_words_1err, 100.0*flex->bch_words_1err/total);
-    verbprintf(0, "FLEX_NEXT:   2-err (fixed):   %lu (%.3f%%)\n", flex->bch_words_2err, 100.0*flex->bch_words_2err/total);
-    verbprintf(0, "FLEX_NEXT:   3+err (uncorr):  %lu (%.4f%%)\n", flex->bch_words_uncorr, 100.0*flex->bch_words_uncorr/total);
-    verbprintf(0, "FLEX_NEXT:   WER: %.6f  BER: %.6f\n", wer, ber);
-  }
-
   free(flex);
 }
 
