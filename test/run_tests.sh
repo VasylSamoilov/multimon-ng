@@ -78,13 +78,13 @@ run_test "POCSAG2400" "POCSAG2400" "flac" "$SAMPLES_DIR/POCSAG_sample_-_2400_bps
 #        instruction messages (INS), group/tagged messages (TG),
 #        K checksum, signature validation — all PII-free
 run_test "FLEX_NEXT 1600/2FSK P2000 proef-alarm" "FLEX_NEXT" "flac" "$SAMPLES_DIR/FLEX_1600_2fsk_P2000_proef_alarm.flac" \
-    "FLEX_NEXT|1600/2|14.116.A|0001120103|SS|5|ALN|3.0.K.N0.R0|test" \
-    "FLEX_NEXT|1600/2|00.012.A|0001180000|SS|5|ALN|3.0.K.N0.R0|TESTOPROEP MOB" \
-    "FLEX_NEXT|1600/2|00.012.A|0001400521|SS|5|ALN|3.0.K.N0.R0|Test: Proefalarm Ochtend Brandweer Veiligheidsregio Rotterdam Rijnmond." \
-    "FLEX_NEXT|1600/2|00.013.A|0001400141|SS|5|ALN|0.0.C.N0.R0|Test: Proefalarm Ochtend Brandweer Veiligheidsregio Rotterdam Rijnmond." \
+    "FLEX_NEXT|1600/2|14.116.A|0001120103|SS|5|ALN|3.0.K.N0.R0.K+.SIG+|test" \
+    "FLEX_NEXT|1600/2|00.012.A|0001180000|SS|5|ALN|3.0.K.N0.R0.K+.SIG+|TESTOPROEP MOB" \
+    "FLEX_NEXT|1600/2|00.012.A|0001400521|SS|5|ALN|3.0.K.N0.R0.K+.SIG+|Test: Proefalarm Ochtend Brandweer Veiligheidsregio Rotterdam Rijnmond." \
+    "FLEX_NEXT|1600/2|00.013.A|0001400141|SS|5|ALN|0.0.C.N0.R0.K+.SIG+|Test: Proefalarm Ochtend Brandweer Veiligheidsregio Rotterdam Rijnmond." \
     "FLEX_NEXT|1600/2|00.039.A|0001420033|SS|1|INS|i=0 frame=40 group=4" \
-    "FLEX_NEXT|1600/2|00.040.A|0002029572 0001420033 0001420999|TG|5|ALN|3.0.K.N0.R0|A2 (DIA: ja) AMBU 17133" \
-    "FLEX_NEXT|1600/2|00.038.A|0001123201|SS|5|ALN|3.0.K.N0.R0|B2 Eindhoven Rit: 105012" \
+    "FLEX_NEXT|1600/2|00.040.A|0002029572 0001420033 0001420999|TG|5|ALN|3.0.K.N0.R0.K+.SIG+|A2 (DIA: ja) AMBU 17133" \
+    "FLEX_NEXT|1600/2|00.038.A|0001123201|SS|5|ALN|3.0.K.N0.R0.K+.SIG+|B2 Eindhoven Rit: 105012" \
     || FAILED=1
 
 # FLEX_NEXT sample: real-world 3200/4FSK pager traffic (NYC, 929.6125 MHz)
@@ -92,12 +92,12 @@ run_test "FLEX_NEXT 1600/2FSK P2000 proef-alarm" "FLEX_NEXT" "flac" "$SAMPLES_DI
 #        fragment reassembly, maildrop flag, K checksum, signature validation
 # NOTE: expectations match only PII-safe fields (capcodes, frame/phase, types)
 run_test "FLEX_NEXT 3200/4FSK sample" "FLEX_NEXT" "flac" "$SAMPLES_DIR/FLEX_3200_4fsk_sample.flac" \
-    "FLEX_NEXT|3200/4|07.044.C|0006715628|LS|5|ALN|3.0.K.N0.R0|Job For 9:03PM" \
-    "FLEX_NEXT|3200/4|07.046.C|0006846776|LS|5|ALN|3.0.K.N0.R0|No Jobs From Borough" \
+    "FLEX_NEXT|3200/4|07.044.C|0006715628|LS|5|ALN|3.0.K.N0.R0.K+.SIG+|Job For 9:03PM" \
+    "FLEX_NEXT|3200/4|07.046.C|0006846776|LS|5|ALN|3.0.K.N0.R0.K+.SIG+|No Jobs From Borough" \
     "FLEX_NEXT|3200/4|07.042.A|0006568749|LS|2|SMSG|49312" \
     "FLEX_NEXT|3200/4|07.044.D|0004709809|LS|2|SMSG|4185" \
-    "FLEX_NEXT|3200/4|07.044.A|0000225027|SS|3|NUM|3.1.F.N12.R0|5076" \
-    "FLEX_NEXT|3200/4|07.053.C|0005613441|LS|5|ALN|3.0.K.N0.R0|note-only: Northampton Generator Normal" \
+    "FLEX_NEXT|3200/4|07.044.A|0000225027|SS|3|NUM|3.0.K.N12.R0.K+|5076" \
+    "FLEX_NEXT|3200/4|07.053.C|0005613441|LS|5|ALN|3.0.K.N0.R0.K+.SIG+|note-only: Northampton Generator Normal" \
     "FLEX_NEXT|3200/4|07.042.B|0004020573|LS|5|ALN" \
     "FLEX_NEXT|3200/4|07.042.D|0002936688|LS|5|ALN" \
     "FLEX_NEXT|3200/4|07.043.B|0006682761|LS|5|ALN" \
