@@ -102,6 +102,44 @@ int bch_pocsag_correct(unsigned int *codeword);
  */
 int bch_flex_next_correct(unsigned int *codeword);
 
+/* ========== GSC Functions ========== */
+
+/*
+ * Initialize Golay(23,12) and BCH(15,7) lookup tables for GSC.
+ * Called automatically on first use of gsc decode functions.
+ */
+void bch_gsc_init(void);
+
+/*
+ * Encode 12-bit data into 23-bit Golay(23,12) codeword.
+ * Input:  data in bits 0-11
+ * Output: 23-bit codeword (data in bits 0-11, parity in bits 12-22)
+ */
+unsigned int bch_golay_encode(unsigned int data);
+
+/*
+ * Correct errors in a Golay(23,12) codeword (up to 3 bit errors).
+ * Input/Output: pointer to 23-bit codeword
+ * On success: *codeword = 12-bit data
+ * Returns: 0 = no errors, 1-3 = corrected bit count, -1 = uncorrectable
+ */
+int bch_golay_correct(unsigned int *codeword);
+
+/*
+ * Encode 7-bit data into 15-bit BCH(15,7) codeword.
+ * Input:  data in bits 0-6
+ * Output: 15-bit codeword (data in bits 0-6, parity in bits 7-14)
+ */
+unsigned int bch_gsc_encode(unsigned int data);
+
+/*
+ * Correct errors in a BCH(15,7) codeword (up to 2 bit errors).
+ * Input/Output: pointer to 15-bit codeword
+ * On success: *codeword = 7-bit data
+ * Returns: 0 = no errors, 1-2 = corrected bit count, -1 = uncorrectable
+ */
+int bch_gsc_correct(unsigned int *codeword);
+
 #ifdef __cplusplus
 }
 #endif
