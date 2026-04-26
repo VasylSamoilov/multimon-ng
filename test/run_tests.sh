@@ -106,6 +106,89 @@ if [ -d "$BCH_REF_DIR" ]; then
 fi
 
 # =============================================================================
+# GSC decoder tests
+# =============================================================================
+echo
+echo "GSC decoder tests:"
+
+run_test "GSC tone" "GSC" "flac" "$SAMPLES_DIR/gsc_capture.flac" \
+    "GSC: Address: 5050059  Function: 1  Tone" \
+    || FAILED=1
+
+run_test "GSC numeric short" "GSC" "flac" "$SAMPLES_DIR/gsc_capture.flac" \
+    "GSC: Address: 2345675  Function: 1  Numeric: \"555-1234\"" \
+    || FAILED=1
+
+run_test "GSC numeric max" "GSC" "flac" "$SAMPLES_DIR/gsc_capture.flac" \
+    "GSC: Address: 3456785  Function: 1  Numeric: \"123456789012345678901234\"" \
+    || FAILED=1
+
+run_test "GSC alpha short" "GSC" "flac" "$SAMPLES_DIR/gsc_capture.flac" \
+    "GSC: Address: 3333335  Function: 1  Alpha:   \"CALL 555-1234\"" \
+    || FAILED=1
+
+run_test "GSC alpha long" "GSC" "flac" "$SAMPLES_DIR/gsc_capture.flac" \
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ" \
+    "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG" \
+    || FAILED=1
+
+run_test "GSC voice" "GSC" "flac" "$SAMPLES_DIR/gsc_capture.flac" \
+    "GSC: Address: 1234561  Function: 1  Voice: message start" \
+    "GSC: Address: 1234561  Function: 1  Voice: message end" \
+    || FAILED=1
+
+run_test "GSC preamble indices" "GSC" "flac" "$SAMPLES_DIR/gsc_capture.flac" \
+    "PREAMBLE0" \
+    "PREAMBLE1" \
+    "PREAMBLE5" \
+    "PREAMBLE9" \
+    || FAILED=1
+
+# GSC IQ capture tests (real-world Swiss financial paging, batch mode)
+run_test "GSC IQ batch mode" "GSC" "flac" "$SAMPLES_DIR/gsc_iq_capture.flac" \
+    "GSC: Address: 0011015  Function: 1  Alpha:" \
+    "CHF 1.5347/52" \
+    || FAILED=1
+
+run_test "GSC IQ batch second addr" "GSC" "flac" "$SAMPLES_DIR/gsc_iq_capture.flac" \
+    "GSC: Address: 0010015  Function: 1  Alpha:" \
+    "CHF1.5347/52 DEM1.6699/06" \
+    || FAILED=1
+
+run_test "GSC IQ normal preamble" "GSC" "flac" "$SAMPLES_DIR/gsc_iq_capture.flac" \
+    "GSC: Address: 0021015  Function: 1  Alpha:" \
+    "SWF 1.5345-55" \
+    "STG 1.4317-22" \
+    || FAILED=1
+
+run_test "GSC IQ stock indices" "GSC" "flac" "$SAMPLES_DIR/gsc_iq_capture.flac" \
+    "GSC: Address: 0021017  Function: 3  Alpha:" \
+    "SPI 1323" \
+    "DAX 171" \
+    || FAILED=1
+
+run_test "GSC IQ commodities" "GSC" "flac" "$SAMPLES_DIR/gsc_iq_capture.flac" \
+    "GSC: Address: 0011017  Function: 3  Alpha:" \
+    "XAU 326.45/6.95" \
+    "OIL 189" \
+    || FAILED=1
+
+run_test "GSC IQ SMI index" "GSC" "flac" "$SAMPLES_DIR/gsc_iq_capture.flac" \
+    "GSC: Address: 0021016  Function: 2  Alpha:" \
+    "SMI 2166.6" \
+    "PLTUZ 347.50-900" \
+    || FAILED=1
+
+run_test "GSC IQ message count" "GSC" "flac" "$SAMPLES_DIR/gsc_iq_capture.flac" \
+    "GSC: Address: 0011015" \
+    "GSC: Address: 0010015" \
+    "GSC: Address: 0021015" \
+    "GSC: Address: 0021017" \
+    "GSC: Address: 0021016" \
+    "GSC: Address: 0011017" \
+    || FAILED=1
+
+# =============================================================================
 # End-to-end tests (gen-ng -> multimon-ng)
 # =============================================================================
 if [ -z "$WINE_CMD" ]; then

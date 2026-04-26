@@ -474,3 +474,240 @@ void bch_init(void)
     
     bch_initialized = 1;
 }
+
+/* ========== GSC: Golay(23,12) + BCH(15,7) ========== */
+
+/*
+ * GSC (Golay Sequential Code) paging uses two error-correcting codes:
+ *
+ * Golay(23,12,3): 12-bit data, 11-bit parity, corrects up to 3 errors.
+ *   Used for preamble codewords, start code, and address words.
+ *   Generator polynomial: x^11 + x^9 + x^7 + x^6 + x^5 + x + 1 (0xC75).
+ *
+ * BCH(15,7,2): 7-bit data, 8-bit parity, corrects up to 2 errors.
+ *   Used for data blocks (alpha/numeric message content).
+ *   Generator polynomial: x^8 + x^4 + x^2 + x + 1 (0x117).
+ *
+ * Both use syndrome-based lookup tables for O(1) correction at runtime.
+ */
+
+/* Golay(23,12) constants */
+#define GOLAY_DATA_BITS   12
+#define GOLAY_PARITY_BITS 11
+#define GOLAY_CODE_LEN    23
+#define GOLAY_GEN_POLY    0xC75   /* x^11+x^9+x^7+x^6+x^5+x+1 */
+
+/* BCH(15,7) constants */
+#define GSC_BCH_DATA_BITS   7
+#define GSC_BCH_PARITY_BITS 8
+#define GSC_BCH_CODE_LEN    15
+#define GSC_BCH_GEN_POLY    0x117  /* x^8+x^4+x^2+x+1 */
+
+/* Encoding tables: golay_enc_tbl[data] = 23-bit codeword */
+static unsigned int golay_enc_tbl[4096];
+
+/* Syndrome lookup: golay_syn_tbl[syndrome] = error pattern (0xFFFFFFFF = uncorrectable) */
+static unsigned int golay_syn_tbl[2048];
+
+/* BCH(15,7) encoding table: gsc_bch_enc_tbl[data] = 15-bit codeword */
+static unsigned short gsc_bch_enc_tbl[128];
+
+/* BCH(15,7) syndrome lookup: gsc_bch_syn_tbl[syndrome] = error pattern (0xFFFF = uncorrectable) */
+static unsigned short gsc_bch_syn_tbl[256];
+
+static int gsc_tables_initialized = 0;
+
+/* Compute 11-bit Golay syndrome by polynomial division */
+static unsigned int golay_syndrome(unsigned int codeword)
+{
+    unsigned int syn = codeword;
+    unsigned int aux = 1u << 22;  /* x^22 */
+
+    if (syn >= (1u << 11)) {
+        while (syn & 0xFFF800u) {  /* bits 11-22 */
+            while (!(aux & syn))
+                aux >>= 1;
+            syn ^= (aux >> 11) * GOLAY_GEN_POLY;
+        }
+    }
+    return syn;
+}
+
+/* Compute 8-bit BCH(15,7) syndrome by polynomial division */
+static unsigned int gsc_bch_syndrome(unsigned int codeword)
+{
+    unsigned int syn = codeword;
+    unsigned int aux = 1u << 14;  /* x^14 */
+
+    if (syn >= (1u << 8)) {
+        while (syn & 0xFF00u) {  /* bits 8-14 */
+            while (!(aux & syn))
+                aux >>= 1;
+            syn ^= (aux >> 8) * GSC_BCH_GEN_POLY;
+        }
+    }
+    return syn;
+}
+
+void bch_gsc_init(void)
+{
+    unsigned int syn, error;
+    int i, j, k, data;
+
+    if (gsc_tables_initialized)
+        return;
+
+    /* ===== Golay(23,12) encoding table ===== */
+    for (data = 0; data < 4096; data++) {
+        syn = (unsigned int)data << 11;
+        /* Polynomial division to get parity */
+        {
+            unsigned int aux = 1u << 22;
+            if (syn >= (1u << 11)) {
+                while (syn & 0xFFF800u) {
+                    while (!(aux & syn))
+                        aux >>= 1;
+                    syn ^= (aux >> 11) * GOLAY_GEN_POLY;
+                }
+            }
+        }
+        golay_enc_tbl[data] = (unsigned int)data | (syn << 12);
+    }
+
+    /* ===== Golay(23,12) syndrome lookup table ===== */
+    /* Initialize all as uncorrectable */
+    for (i = 0; i < 2048; i++)
+        golay_syn_tbl[i] = 0xFFFFFFFF;
+
+    golay_syn_tbl[0] = 0;  /* no errors */
+
+    /* Weight-1 errors */
+    for (i = 0; i < 23; i++) {
+        error = 1u << i;
+        syn = golay_syndrome(error);
+        golay_syn_tbl[syn] = error;
+    }
+
+    /* Weight-2 errors */
+    for (i = 0; i < 23; i++) {
+        for (j = i + 1; j < 23; j++) {
+            error = (1u << i) | (1u << j);
+            syn = golay_syndrome(error);
+            if (golay_syn_tbl[syn] == 0xFFFFFFFF)
+                golay_syn_tbl[syn] = error;
+        }
+    }
+
+    /* Weight-3 errors */
+    for (i = 0; i < 23; i++) {
+        for (j = i + 1; j < 23; j++) {
+            for (k = j + 1; k < 23; k++) {
+                error = (1u << i) | (1u << j) | (1u << k);
+                syn = golay_syndrome(error);
+                if (golay_syn_tbl[syn] == 0xFFFFFFFF)
+                    golay_syn_tbl[syn] = error;
+            }
+        }
+    }
+
+    /* ===== BCH(15,7) encoding table ===== */
+    for (data = 0; data < 128; data++) {
+        syn = (unsigned int)data << 8;
+        {
+            unsigned int aux = 1u << 14;
+            if (syn >= (1u << 8)) {
+                while (syn & 0xFF00u) {
+                    while (!(aux & syn))
+                        aux >>= 1;
+                    syn ^= (aux >> 8) * GSC_BCH_GEN_POLY;
+                }
+            }
+        }
+        gsc_bch_enc_tbl[data] = (unsigned short)(data | (syn << 7));
+    }
+
+    /* ===== BCH(15,7) syndrome lookup table ===== */
+    for (i = 0; i < 256; i++)
+        gsc_bch_syn_tbl[i] = 0xFFFF;
+
+    gsc_bch_syn_tbl[0] = 0;
+
+    /* Weight-1 errors */
+    for (i = 0; i < 15; i++) {
+        error = 1u << i;
+        syn = gsc_bch_syndrome(error);
+        gsc_bch_syn_tbl[syn] = (unsigned short)error;
+    }
+
+    /* Weight-2 errors */
+    for (i = 0; i < 15; i++) {
+        for (j = i + 1; j < 15; j++) {
+            error = (1u << i) | (1u << j);
+            syn = gsc_bch_syndrome(error);
+            if (gsc_bch_syn_tbl[syn] == 0xFFFF)
+                gsc_bch_syn_tbl[syn] = (unsigned short)error;
+        }
+    }
+
+    gsc_tables_initialized = 1;
+}
+
+unsigned int bch_golay_encode(unsigned int data)
+{
+    if (!gsc_tables_initialized)
+        bch_gsc_init();
+    return golay_enc_tbl[data & 0xFFF];
+}
+
+int bch_golay_correct(unsigned int *codeword)
+{
+    unsigned int syn, error, corrected;
+
+    if (!gsc_tables_initialized)
+        bch_gsc_init();
+
+    syn = golay_syndrome(*codeword & 0x7FFFFF);
+
+    if (syn == 0) {
+        *codeword = *codeword & 0xFFF;
+        return 0;
+    }
+
+    error = golay_syn_tbl[syn];
+    if (error == 0xFFFFFFFF)
+        return -1;
+
+    corrected = (*codeword ^ error) & 0xFFF;
+    *codeword = corrected;
+    return popcount32(error);
+}
+
+unsigned int bch_gsc_encode(unsigned int data)
+{
+    if (!gsc_tables_initialized)
+        bch_gsc_init();
+    return gsc_bch_enc_tbl[data & 0x7F];
+}
+
+int bch_gsc_correct(unsigned int *codeword)
+{
+    unsigned int syn, error, corrected;
+
+    if (!gsc_tables_initialized)
+        bch_gsc_init();
+
+    syn = gsc_bch_syndrome(*codeword & 0x7FFF);
+
+    if (syn == 0) {
+        *codeword = *codeword & 0x7F;
+        return 0;
+    }
+
+    error = gsc_bch_syn_tbl[syn];
+    if (error == 0xFFFF)
+        return -1;
+
+    corrected = (*codeword ^ error) & 0x7F;
+    *codeword = corrected;
+    return popcount32(error);
+}
