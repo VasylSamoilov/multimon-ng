@@ -2300,7 +2300,7 @@ static void parse_short_message(struct Flex_Next * flex, unsigned int * phaseptr
       unsigned int multiplier = (phaseptr[j] >> 14) & 0x07;
       unsigned int tmf = (phaseptr[j] >> 17) & 0x0F;
       if (!json_mode) {
-        verbprintf(0, "%s|SMSG|NID area=%u mult=%u tmf=0x%X\n", flex->line_prefix, area_id, multiplier, tmf);
+        verbprintf(0, "%s|SMSG|K.NID|area=%u multiplier=%u traffic_flags=0x%X\n", flex->line_prefix, area_id, multiplier, tmf);
       } else {
         cJSON *extra = cJSON_CreateObject();
         cJSON_AddStringToObject(extra, "smsg_sub_type", "network_id");
@@ -2346,7 +2346,7 @@ static void parse_short_message(struct Flex_Next * flex, unsigned int * phaseptr
     if (all_space) {
       // Pure tone-only: all digits are space fill, no data content
       if (!json_mode) {
-        verbprintf(0, "%s|TON|\n", flex->line_prefix);
+        verbprintf(0, "%s|SMSG|K.TON|\n", flex->line_prefix);
       } else {
         flex_next_json_emit(flex, flex->Decode.phase, flex->Decode.capcode, flex->Decode.addr_type,
                             0, FLEX_PAGETYPE_SHORT_MESSAGE, "TON", "complete",
@@ -2355,7 +2355,7 @@ static void parse_short_message(struct Flex_Next * flex, unsigned int * phaseptr
     } else {
       // Short numeric message with actual digit content
       if (!json_mode) {
-        verbprintf(0, "%s|SMSG|%s\n", flex->line_prefix, digits);
+        verbprintf(0, "%s|SMSG|K.NUM|%s\n", flex->line_prefix, digits);
       } else {
         cJSON *extra = cJSON_CreateObject();
         cJSON_AddStringToObject(extra, "smsg_sub_type", "numeric");
@@ -2371,7 +2371,7 @@ static void parse_short_message(struct Flex_Next * flex, unsigned int * phaseptr
     // d0-d2 = S2S1S0 (source code 0-7)
     unsigned int source = (phaseptr[j] >> 9) & 0x07;
     if (!json_mode) {
-      verbprintf(0, "%s|SMSG|SRC=%u\n", flex->line_prefix, source);
+      verbprintf(0, "%s|SMSG|K.SRC|SRC=%u\n", flex->line_prefix, source);
     } else {
       cJSON *extra = cJSON_CreateObject();
       cJSON_AddStringToObject(extra, "smsg_sub_type", "source");
@@ -2393,7 +2393,7 @@ static void parse_short_message(struct Flex_Next * flex, unsigned int * phaseptr
     unsigned int msg_n  = (phaseptr[j] >> 12) & 0x3F;
     unsigned int msg_r  = (phaseptr[j] >> 18) & 0x01;
     if (!json_mode) {
-      verbprintf(0, "%s|SMSG|S=%u N=%u R=%u\n", flex->line_prefix, source, msg_n, msg_r);
+      verbprintf(0, "%s|SMSG|K.SRC.N%u.R%u|SRC=%u\n", flex->line_prefix, msg_n, msg_r, source);
     } else {
       cJSON *extra = cJSON_CreateObject();
       cJSON_AddStringToObject(extra, "smsg_sub_type", "numbered");
@@ -2409,7 +2409,7 @@ static void parse_short_message(struct Flex_Next * flex, unsigned int * phaseptr
   default:
     // t=11: Reserved
     if (!json_mode) {
-      verbprintf(0, "%s|SMSG|RSVD t=%u d=0x%03X\n", flex->line_prefix, sub_type, (phaseptr[j] >> 9) & 0xFFF);
+      verbprintf(0, "%s|SMSG|K.RSV|subtype=%u data=0x%03X\n", flex->line_prefix, sub_type, (phaseptr[j] >> 9) & 0xFFF);
     } else {
       cJSON *extra = cJSON_CreateObject();
       cJSON_AddStringToObject(extra, "smsg_sub_type", "reserved");
@@ -3359,7 +3359,7 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
                       char flex_ts[32];
                       flex_local_timestamp(flex_ts, sizeof(flex_ts));
                       if (instr_type == 0) {
-                        verbprintf(0, "FLEX_NEXT|%s|%i/%i|%02i.%03i.%c|%010" PRId64 "|%c|INS|assign_group=%d deliver_frame=%u\n",
+                        verbprintf(0, "FLEX_NEXT|%s|%i/%i|%02i.%03i.%c|%010" PRId64 "|%c|INS|K|assign_group=%d deliver_frame=%u\n",
                                  flex_ts,
                                  flex->Sync.baud, flex->Sync.levels,
                                  flex->FIW.cycleno, flex->FIW.frameno, PhaseNo,
@@ -3367,7 +3367,7 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
                                  addr_type_char(phaseptr[i], flex->Decode.long_address),
                                  groupbit, iAssignedFrame);
                       } else {
-                        verbprintf(0, "FLEX_NEXT|%s|%i/%i|%02i.%03i.%c|%010" PRId64 "|%c|INS|i=%u frame=%u group=%d\n",
+                        verbprintf(0, "FLEX_NEXT|%s|%i/%i|%02i.%03i.%c|%010" PRId64 "|%c|INS|K|type=%u frame=%u group=%d\n",
                                  flex_ts,
                                  flex->Sync.baud, flex->Sync.levels,
                                  flex->FIW.cycleno, flex->FIW.frameno, PhaseNo,
@@ -3700,7 +3700,7 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
       unsigned int zones   = (net_mw >> 6) & 0x1F;
       unsigned int traffic = (net_mw >> 11) & 0x3FF;
       if (!json_mode) {
-        verbprintf(0, "%s|NET|area=%u zones=%u traffic=0x%03X\n", flex->line_prefix, area_id, zones, traffic);
+        verbprintf(0, "%s|NET|K|area=%u zones=%u traffic=0x%03X\n", flex->line_prefix, area_id, zones, traffic);
       } else {
         cJSON *json = cJSON_CreateObject();
         if (json) {
@@ -3794,7 +3794,7 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
       }
       if (sec_t == 0) {
         // t=00: alphanumeric content - decode like alpha
-        flex->line_type_tag = "SEC";
+        flex->line_type_tag = "SEC:ALN";
         flex->Decode.sec_subtype = "alpha";
         parse_alphanumeric(flex, decode_words, decode_errs, hdr, mw1, len, frag, cont, msg_n, msg_r, msg_m, dedup_flag, flex_groupmessage, flex_groupbit);
       } else if (sec_t == 2) {
@@ -3804,11 +3804,7 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
         parse_binary(flex, decode_words, decode_errs, mw1, len, frag, cont, msg_n, msg_r, msg_m, dedup_flag);
       } else {
         // t=01, t=11, or unknown: dump as hex
-        {
-          static char sec_tag[16];
-          snprintf(sec_tag, sizeof(sec_tag), "SEC:t%d", sec_t >= 0 ? sec_t : -1);
-          flex->line_type_tag = sec_tag;
-        }
+        flex->line_type_tag = (sec_t == 1) ? "SEC:VEN" : "SEC:RSV";
         flex->Decode.sec_subtype = (sec_t == 1) ? "vendor" : "reserved";
         parse_binary(flex, decode_words, decode_errs, mw1, len, frag, cont, msg_n, msg_r, msg_m, dedup_flag);
       }
