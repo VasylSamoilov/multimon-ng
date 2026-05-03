@@ -3359,21 +3359,48 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
                       char flex_ts[32];
                       flex_local_timestamp(flex_ts, sizeof(flex_ts));
                       if (instr_type == 0) {
-                        verbprintf(0, "FLEX_NEXT|%s|%i/%i|%02i.%03i.%c|%010" PRId64 "|%c|INS|K|assign_group=%d deliver_frame=%u\n",
+                        // Temporary Address activation (group setup)
+                        verbprintf(0, "FLEX_NEXT|%s|%i/%i|%02i.%03i.%c|%010" PRId64 "|%c|INS|K.GRP|slot=%d deliver_frame=%u\n",
                                  flex_ts,
                                  flex->Sync.baud, flex->Sync.levels,
                                  flex->FIW.cycleno, flex->FIW.frameno, PhaseNo,
                                  flex->Decode.capcode,
                                  addr_type_char(phaseptr[i], flex->Decode.long_address),
                                  groupbit, iAssignedFrame);
-                      } else {
-                        verbprintf(0, "FLEX_NEXT|%s|%i/%i|%02i.%03i.%c|%010" PRId64 "|%c|INS|K|type=%u frame=%u group=%d\n",
+                      } else if (instr_type == 1) {
+                        // System Event Notification - decode 11-bit event flags
+                        unsigned int evt_data = (viw >> 9) & 0x7FF;
+                        char evt_msg[256];
+                        int epos = 0;
+                        static const char *evt_names[] = {
+                          "traffic_split_ssid", "traffic_split_nid",
+                          "chan_setup_change", "new_freq_nid", "new_freq_ssid"
+                        };
+                        int ei;
+                        for (ei = 0; ei < 5; ei++) {
+                          if (evt_data & (1u << ei)) {
+                            if (epos > 0) evt_msg[epos++] = ' ';
+                            epos += snprintf(evt_msg + epos, sizeof(evt_msg) - epos, "%s", evt_names[ei]);
+                          }
+                        }
+                        if (epos == 0) epos += snprintf(evt_msg, sizeof(evt_msg), "none");
+                        verbprintf(0, "FLEX_NEXT|%s|%i/%i|%02i.%03i.%c|%010" PRId64 "|%c|INS|K.EVT|%s\n",
                                  flex_ts,
                                  flex->Sync.baud, flex->Sync.levels,
                                  flex->FIW.cycleno, flex->FIW.frameno, PhaseNo,
                                  flex->Decode.capcode,
                                  addr_type_char(phaseptr[i], flex->Decode.long_address),
-                                 instr_type, iAssignedFrame, groupbit);
+                                 evt_msg);
+                      } else {
+                        // Reserved instruction type - raw data
+                        unsigned int raw_data = (viw >> 9) & 0x7FF;
+                        verbprintf(0, "FLEX_NEXT|%s|%i/%i|%02i.%03i.%c|%010" PRId64 "|%c|INS|K.RSV|type=%u data=0x%03X\n",
+                                 flex_ts,
+                                 flex->Sync.baud, flex->Sync.levels,
+                                 flex->FIW.cycleno, flex->FIW.frameno, PhaseNo,
+                                 flex->Decode.capcode,
+                                 addr_type_char(phaseptr[i], flex->Decode.long_address),
+                                 instr_type, raw_data);
                       }
                     } else {
                       cJSON *json = cJSON_CreateObject();
@@ -3752,12 +3779,8 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
     }
 
     // Info Service Address (Section 3.8.2, under study):
-    // No defined protocol yet.  Log raw hex payload.
-    if (flex->Decode.addr_type == 'I') {
-      flex->line_type_tag = "ISV";
-      parse_binary(flex, decode_words, decode_errs, mw1, len, frag, cont, msg_n, msg_r, msg_m, dedup_flag);
-      goto page_done;
-    }
+    // No special handling — decoded by normal type dispatch below.
+    // Address type 'I' distinguishes it from regular messages.
 
     // Reserved Short Address: log and skip (no defined behavior).
     if (flex->Decode.addr_type == 'R') {
