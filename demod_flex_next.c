@@ -347,6 +347,11 @@ struct Flex_Fragment {
   int                         f_mismatch;    // 1 if any F sequence mismatch detected (missing fragment)
   char                        phase;         // phase letter (A/B/C/D) from first fragment
   char                        addr_type;     // address type char from first fragment
+  // HEX hdr2 fields (from initial fragment, carried through reassembly)
+  int                         hex_blocking;  // B field: bits per char (0=16)
+  int                         hex_display_rtl; // D field: 0=LTR, 1=RTL
+  int                         hex_header_msg;  // H field: 1=header message
+  int                         hex_status_info; // I field: 1=encoding in data
 };
 
 struct Flex_FragStore {
@@ -2477,8 +2482,22 @@ static void parse_binary(struct Flex_Next * flex, unsigned int * phaseptr, int *
   int is_initial = (frag == 3);
   unsigned int data_start = mw1;
 
-  int hex_blocking = 0;   // B field: bits per character (0=16)
-  uint32_t hex_rx_sig = 0; // S field: 8-bit signature
+  int hex_blocking = 0;   // B field (4 bits): bits per character/data unit.
+                          //   0000=16 bits, 0001=1 bit (default), ..., 1111=15 bits.
+                          //   Defines character boundaries for termination fill stripping.
+  int hex_display_rtl = 0; // D field (1 bit): display direction.
+                          //   0=left-to-right, 1=right-to-left.
+                          //   Only meaningful when B != 0001 (multi-bit characters).
+  int hex_header_msg = 0;  // H field (1 bit): header message flag.
+                          //   1=this is a displayable header; a transparent data message
+                          //   with the same N will follow. Both complete independently.
+  int hex_status_info = 0; // I field (1 bit): status information field enabler.
+                          //   0=standard HEX/Binary data.
+                          //   1=first 8 bits of data field indicate encoding method
+                          //   (encoding method definition currently reserved).
+  uint32_t hex_rx_sig = 0; // S field (8 bits): message signature.
+                          //   1's complement of binary sum of all data bytes
+                          //   across all fragments (excluding termination fill).
   int hex_has_sig = 0;
   int hex_sig_fail = 0;
 
@@ -2496,11 +2515,15 @@ static void parse_binary(struct Flex_Next * flex, unsigned int * phaseptr, int *
     if (mw1 < PHASE_WORDS && !bch_err[mw1]) {
       unsigned int hdr2 = phaseptr[mw1];
       hex_blocking = (hdr2 >> 4) & 0xF;
+      hex_display_rtl = (hdr2 >> 2) & 1;
+      hex_header_msg = (hdr2 >> 3) & 1;
+      hex_status_info = (hdr2 >> 8) & 1;
       hex_rx_sig = (hdr2 >> 13) & 0xFF;
       hex_has_sig = 1;
-      verbprintf(3, "FLEX_NEXT: HEX hdr2=0x%05X R=%u B=%u(%d bits/char) S=0x%02X\n",
-                 hdr2, hdr2 & 1, hex_blocking,
-                 hex_blocking ? hex_blocking : 16, hex_rx_sig);
+      verbprintf(3, "FLEX_NEXT: HEX hdr2=0x%05X R=%u M=%u D=%u H=%u B=%u(%d bits/char) I=%u S=0x%02X\n",
+                 hdr2, hdr2 & 1, (hdr2 >> 1) & 1, hex_display_rtl, hex_header_msg,
+                 hex_blocking, hex_blocking ? hex_blocking : 16,
+                 hex_status_info, hex_rx_sig);
     }
     data_start = mw1 + 1;
     len--;
@@ -2661,19 +2684,26 @@ static void parse_binary(struct Flex_Next * flex, unsigned int * phaseptr, int *
       if (is_initial_hex) {
         flex->FragStore.slots[fslot].msg_r = msg_r;
         flex->FragStore.slots[fslot].msg_m = msg_m;
+        flex->FragStore.slots[fslot].hex_blocking = hex_blocking;
+        flex->FragStore.slots[fslot].hex_display_rtl = hex_display_rtl;
+        flex->FragStore.slots[fslot].hex_header_msg = hex_header_msg;
+        flex->FragStore.slots[fslot].hex_status_info = hex_status_info;
       }
       verbprintf(3, "FLEX_NEXT: HEX buffered fragment for cap %" PRId64 " (%d nibbles in slot %d)\n",
                  flex->Decode.capcode, flex->FragStore.slots[fslot].data_len, fslot);
     }
-    // Output frag flags. For continuations, carry R/M from stored initial.
+    // Output frag flags
     if (!json_mode) {
+      int blk = is_initial_hex ? (hex_blocking ? hex_blocking : 16) : (fslot >= 0 ? (flex->FragStore.slots[fslot].hex_blocking ? flex->FragStore.slots[fslot].hex_blocking : 16) : 0);
+      const char *dir = is_initial_hex ? (hex_display_rtl ? "RTL" : "LTR") : (fslot >= 0 ? (flex->FragStore.slots[fslot].hex_display_rtl ? "RTL" : "LTR") : "LTR");
       int out_r = is_initial_hex ? msg_r : (fslot >= 0 ? flex->FragStore.slots[fslot].msg_r : -1);
       int out_m = is_initial_hex ? msg_m : (fslot >= 0 ? flex->FragStore.slots[fslot].msg_m : -1);
+      const char *hdr = is_initial_hex ? (hex_header_msg ? ".HDR" : "") : (fslot >= 0 && flex->FragStore.slots[fslot].hex_header_msg ? ".HDR" : "");
+      const char *sti = is_initial_hex ? (hex_status_info ? ".STI" : "") : (fslot >= 0 && flex->FragStore.slots[fslot].hex_status_info ? ".STI" : "");
       if (out_r >= 0)
-        verbprintf(0, "%c.N%d.R%d%s|", frag_flag, msg_n, out_r, out_m ? ".M" : "");
+        verbprintf(0, "%s|%s|%c.%d/%d.N%d.R%d%s.B=%d.%s%s%s|%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, fslot >= 0 ? flex->FragStore.slots[fslot].frag_index : 0, frag, msg_n, out_r, out_m ? ".M" : "", blk, dir, hdr, sti, hex);
       else
-        verbprintf(0, "%c.N%d|", frag_flag, msg_n);
-      verbprintf(0, "%s", hex);
+        verbprintf(0, "%s|%s|%c.%d/%d.N%d.B=%d.%s%s%s|%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, fslot >= 0 ? flex->FragStore.slots[fslot].frag_index : 0, frag, msg_n, blk, dir, hdr, sti, hex);
     } else {
       flex_next_json_emit(flex, flex->Decode.phase, flex->Decode.capcode, flex->Decode.addr_type,
                           0, flex->Decode.type, "HEX", is_initial_hex ? "fragment_start" : "fragment_orphan",
@@ -2739,15 +2769,22 @@ static void parse_binary(struct Flex_Next * flex, unsigned int * phaseptr, int *
   if (!json_mode) {
     const char *dup_str = (dedup_flag == 2) ? ".DUP+" : (dedup_flag == 1) ? ".DUP" : "";
     const char *sig_str = hex_sig_fail ? ".SIG-" : ".SIG+";
-    if (is_initial_hex)
-      verbprintf(0, "%s|%s|%c.0/%d.N%d.R%d%s%s%s|%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, frag, msg_n, msg_r, msg_m ? ".M" : "", sig_str, dup_str, hex);
-    else
+    if (is_initial_hex) {
+      int blk = hex_blocking ? hex_blocking : 16;
+      const char *dir = hex_display_rtl ? "RTL" : "LTR";
+      const char *hdr = hex_header_msg ? ".HDR" : "";
+      const char *sti = hex_status_info ? ".STI" : "";
+      verbprintf(0, "%s|%s|%c.0/%d.N%d.R%d%s%s.B=%d.%s%s%s%s|%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, frag, msg_n, msg_r, msg_m ? ".M" : "", sig_str, blk, dir, hdr, sti, dup_str, hex);
+    } else
       verbprintf(0, "%s|%s|%c.0/%d.N%d%s%s|%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, frag, msg_n, sig_str, dup_str, hex);
   } else {
     cJSON *extra = NULL;
-    if (hex_has_sig) {
+    if (is_initial_hex) {
       extra = cJSON_CreateObject();
       cJSON_AddNumberToObject(extra, "blocking", hex_blocking ? hex_blocking : 16);
+      cJSON_AddBoolToObject(extra, "display_rtl", hex_display_rtl);
+      cJSON_AddBoolToObject(extra, "header_msg", hex_header_msg);
+      cJSON_AddBoolToObject(extra, "status_info", hex_status_info);
     }
     flex_next_json_emit(flex, flex->Decode.phase, flex->Decode.capcode, flex->Decode.addr_type,
                         0, flex->Decode.type, "HEX", "complete",
