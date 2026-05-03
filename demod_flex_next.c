@@ -530,6 +530,24 @@ static int flextime_date_valid(unsigned int year, unsigned int mon, unsigned int
   return day <= max_day;
 }
 
+/* Format local system time as ISO 8601 with timezone offset.
+ * Output: "YYYY-MM-DD HH:MM:SS+HH:MM" (25 chars + NUL).
+ * buf must be at least 32 bytes. */
+static void flex_local_timestamp(char *buf, size_t bufsz) {
+  time_t now = time(NULL);
+  struct tm lt;
+  localtime_r(&now, &lt);
+  int off = (int)lt.tm_gmtoff;
+  char sign = off >= 0 ? '+' : '-';
+  if (off < 0) off = -off;
+  int off_h = off / 3600;
+  int off_m = (off % 3600) / 60;
+  snprintf(buf, bufsz, "%04d-%02d-%02d %02d:%02d:%02d%c%02d:%02d",
+           lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday,
+           lt.tm_hour, lt.tm_min, lt.tm_sec,
+           sign, off_h, off_m);
+}
+
 /* Cross-validate a single BIW reading against the FIW-derived minute.
  * The FIW minute is computed fresh from cycle/frame -- it's the ground truth.
  * The BIW minute is the incoming reading we're checking.
@@ -1454,7 +1472,10 @@ static void frag_expire(struct Flex_Next * flex, unsigned int current_frame) {
                                 (const char *)flex->FragStore.slots[i].data,
                                 NULL, 0, NULL);
           } else {
-            verbprintf(0, "FLEX_NEXT|%u/%u|%02u.%03u.%c|%010" PRId64 "|%cS|5|ALN|PARTIAL.N%d%s|%.*s\n",
+            char flex_ts[32];
+            flex_local_timestamp(flex_ts, sizeof(flex_ts));
+            verbprintf(0, "FLEX_NEXT|%s|%u/%u|%02u.%03u.%c|%010" PRId64 "|%c|ALN|PARTIAL.N%d%s|%.*s\n",
+                       flex_ts,
                        flex->Sync.baud, flex->Sync.levels,
                        current_frame / 128, current_frame % 128,
                        flex->FragStore.slots[i].phase,
@@ -1608,6 +1629,11 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
         // Frag flags output is deferred to each branch (F/C/K) so that
         // reassembled messages can carry R/M from the initial fragment.
 
+        // Group slot tag for temp group messages (empty for non-group)
+        char grp_tag[8] = "";
+        if (flex_groupmessage && flex_groupbit >= 0 && flex_groupbit < 16)
+          snprintf(grp_tag, sizeof(grp_tag), ".G%d", flex_groupbit);
+
         unsigned char message[MAX_ALN];
         memset(message, '\0', MAX_ALN);
         int  currentChar = 0;
@@ -1747,7 +1773,10 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
                                     (const char *)flex->FragStore.slots[slot].data,
                                     NULL, 0, NULL);
               } else {
-                verbprintf(0, "FLEX_NEXT|%u/%u|%02u.%03u.%c|%010" PRId64 "|%cS|5|ALN|PARTIAL.N%d%s|%.*s\n",
+                char flex_ts[32];
+                flex_local_timestamp(flex_ts, sizeof(flex_ts));
+                verbprintf(0, "FLEX_NEXT|%s|%u/%u|%02u.%03u.%c|%010" PRId64 "|%c|ALN|PARTIAL.N%d%s|%.*s\n",
+                           flex_ts,
                            flex->Sync.baud, flex->Sync.levels,
                            flex->FIW.cycleno, flex->FIW.frameno,
                            flex->FragStore.slots[slot].phase,
@@ -1802,9 +1831,9 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
             int out_m = is_initial ? msg_m : (slot >= 0 ? flex->FragStore.slots[slot].msg_m : -1);
             const char *k_str = k_fail ? ".K-" : ".K+";
             if (out_r >= 0)
-              verbprintf(0, "%1d.%1d.%c.N%d.R%d%s%s|%s", frag, cont, frag_flag, msg_n, out_r, out_m ? ".M" : "", k_str, message);
+              verbprintf(0, "%c.%d/%d.N%d.R%d%s%s%s|%s", frag_flag, slot >= 0 ? flex->FragStore.slots[slot].frag_index : 0, frag, msg_n, out_r, out_m ? ".M" : "", k_str, grp_tag, message);
             else
-              verbprintf(0, "%1d.%1d.%c.N%d%s|%s", frag, cont, frag_flag, msg_n, k_str, message);
+              verbprintf(0, "%c.%d/%d.N%d%s%s|%s", frag_flag, slot >= 0 ? flex->FragStore.slots[slot].frag_index : 0, frag, msg_n, k_str, grp_tag, message);
           } else {
             int out_r = is_initial ? msg_r : (slot >= 0 ? flex->FragStore.slots[slot].msg_r : -1);
             int out_m = is_initial ? msg_m : (slot >= 0 ? flex->FragStore.slots[slot].msg_m : -1);
@@ -1832,6 +1861,14 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
           if (slot >= 0)
             verbprintf(3, "FLEX_NEXT: Buffered fragment for cap %" PRId64 " (%d bytes in slot %d)\n",
                        flex->Decode.capcode, flex->FragStore.slots[slot].data_len, slot);
+          /* Keep group alive while fragments are arriving.
+           * Only bump if we're past the delivery frame (timeout would fire). */
+          if (flex_groupmessage && flex_groupbit >= 0 && flex_groupbit < GROUP_BITS &&
+              flex->GroupHandler.GroupFrame[flex_groupbit] >= 0 &&
+              flex->GroupHandler.GroupFrame[flex_groupbit] < (int)flex->FIW.frameno) {
+            flex->GroupHandler.GroupFrame[flex_groupbit] = (int)flex->FIW.frameno;
+            flex->GroupHandler.GroupCycle[flex_groupbit] = (int)flex->FIW.cycleno;
+          }
           return;
         }
 
@@ -1865,10 +1902,10 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
               const char *k_str = k_fail ? ".K-" : ".K+";
               const char *sig_str = reassembled_sig_fail ? ".SIG-" : ".SIG+";
               if (out_r >= 0)
-                verbprintf(0, "%1d.%1d.%c.N%d.R%d%s%s%s|%.*s%s", frag, cont, frag_flag, msg_n, out_r, out_m ? ".M" : "", k_str, sig_str,
+                verbprintf(0, "%c.%d/%d.N%d.R%d%s%s%s%s|%.*s%s", frag_flag, flex->FragStore.slots[slot].frag_index + 1, frag, msg_n, out_r, out_m ? ".M" : "", k_str, sig_str, grp_tag,
                            (int)flex->FragStore.slots[slot].data_len, flex->FragStore.slots[slot].data, message);
               else
-                verbprintf(0, "%1d.%1d.%c.N%d%s%s|%.*s%s", frag, cont, frag_flag, msg_n, k_str, sig_str,
+                verbprintf(0, "%c.%d/%d.N%d%s%s%s|%.*s%s", frag_flag, flex->FragStore.slots[slot].frag_index + 1, frag, msg_n, k_str, sig_str, grp_tag,
                            (int)flex->FragStore.slots[slot].data_len, flex->FragStore.slots[slot].data, message);
             } else {
               char reassembled[MAX_ALN * 2];
@@ -1905,7 +1942,7 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
           }
           // No buffered fragment found, output what we have
           if (!json_mode) {
-            verbprintf(0, "%1d.%1d.%c.N%d%s|%s", frag, cont, frag_flag, msg_n, k_fail ? ".K-" : ".K+", message);
+            verbprintf(0, "%c.0/%d.N%d%s%s|%s", frag_flag, frag, msg_n, k_fail ? ".K-" : ".K+", grp_tag, message);
           } else {
             flex_next_json_emit(flex, flex->Decode.phase, flex->Decode.capcode,
                                 flex->Decode.addr_type, flex_groupmessage, flex->Decode.type,
@@ -1927,7 +1964,7 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
           const char *dup_str = (dedup_flag == 2) ? ".DUP+" : (dedup_flag == 1) ? ".DUP" : "";
           const char *k_str = k_fail ? ".K-" : ".K+";
           const char *sig_str = sig_fail ? ".SIG-" : ".SIG+";
-          verbprintf(0, "%1d.%1d.%c.N%d.R%d%s%s%s%s|%s", frag, cont, frag_flag, msg_n, msg_r, msg_m ? ".M" : "", k_str, sig_str, dup_str, message);
+          verbprintf(0, "%c.0/%d.N%d.R%d%s%s%s%s%s|%s", frag_flag, frag, msg_n, msg_r, msg_m ? ".M" : "", k_str, sig_str, dup_str, grp_tag, message);
         } else {
           flex_next_json_emit(flex, flex->Decode.phase, flex->Decode.capcode,
                               flex->Decode.addr_type, flex_groupmessage, flex->Decode.type,
@@ -1953,6 +1990,7 @@ group_output:
                 flex->GroupHandler.GroupCodes[flex_groupbit][CAPCODES_INDEX] = 0;
                 flex->GroupHandler.GroupFrame[flex_groupbit] = -1;
                 flex->GroupHandler.GroupCycle[flex_groupbit] = -1;
+                verbprintf(3, "FLEX_NEXT: Group teardown after delivery: groupbit=%d\n", flex_groupbit);
         } 
 }
 
@@ -3174,13 +3212,11 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
       // Tone-only: address with no vector, output at debug level
       if (flex->Decode.capcode != 1) {  // skip idle artifact capcode 1
         if (!json_mode)
-          verbprintf(1, "FLEX_NEXT|%i/%i|%02i.%03i.%c|%010" PRId64 "|%c%c|%d|TON|\n",
+          verbprintf(3, "FLEX_NEXT|%i/%i|%02i.%03i.%c|%010" PRId64 "|%c|TON|\n",
                    flex->Sync.baud, flex->Sync.levels,
                    flex->FIW.cycleno, flex->FIW.frameno, PhaseNo,
                    flex->Decode.capcode,
-                   addr_type_char(phaseptr[i], flex->Decode.long_address),
-                   (flex_groupmessage ? 'G' : 'S'),
-                   FLEX_PAGETYPE_TONE_ONLY);
+                   addr_type_char(phaseptr[i], flex->Decode.long_address));
         if (json_mode)
           flex_next_json_emit(flex, PhaseNo, flex->Decode.capcode, flex->Decode.addr_type,
                               0, FLEX_PAGETYPE_TONE_ONLY, "TON", "complete",
@@ -3221,14 +3257,25 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
 
                     // Output the instruction for visibility
                     if (!json_mode) {
-                      verbprintf(0, "FLEX_NEXT|%i/%i|%02i.%03i.%c|%010" PRId64 "|%c%c|%1d|INS|i=%u frame=%u group=%d\n",
-                               flex->Sync.baud, flex->Sync.levels,
-                               flex->FIW.cycleno, flex->FIW.frameno, PhaseNo,
-                               flex->Decode.capcode,
-                               addr_type_char(phaseptr[i], flex->Decode.long_address),
-                               (flex_groupmessage ? 'G' : 'S'),
-                               flex->Decode.type,
-                               instr_type, iAssignedFrame, groupbit);
+                      char flex_ts[32];
+                      flex_local_timestamp(flex_ts, sizeof(flex_ts));
+                      if (instr_type == 0) {
+                        verbprintf(0, "FLEX_NEXT|%s|%i/%i|%02i.%03i.%c|%010" PRId64 "|%c|INS|assign_group=%d deliver_frame=%u\n",
+                                 flex_ts,
+                                 flex->Sync.baud, flex->Sync.levels,
+                                 flex->FIW.cycleno, flex->FIW.frameno, PhaseNo,
+                                 flex->Decode.capcode,
+                                 addr_type_char(phaseptr[i], flex->Decode.long_address),
+                                 groupbit, iAssignedFrame);
+                      } else {
+                        verbprintf(0, "FLEX_NEXT|%s|%i/%i|%02i.%03i.%c|%010" PRId64 "|%c|INS|i=%u frame=%u group=%d\n",
+                                 flex_ts,
+                                 flex->Sync.baud, flex->Sync.levels,
+                                 flex->FIW.cycleno, flex->FIW.frameno, PhaseNo,
+                                 flex->Decode.capcode,
+                                 addr_type_char(phaseptr[i], flex->Decode.long_address),
+                                 instr_type, iAssignedFrame, groupbit);
+                      }
                     } else {
                       cJSON *json = cJSON_CreateObject();
                       if (json) {
@@ -3267,6 +3314,18 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
                       vec_used += flex->Decode.long_address ? 2 : 1;
                       if (flex->Decode.long_address) i++;
                       continue;
+                    }
+
+                    /* If this group slot is already active with a different
+                     * delivery frame, tear it down first to avoid mixing
+                     * capcodes from different group setups. */
+                    if (flex->GroupHandler.GroupFrame[groupbit] >= 0 &&
+                        flex->GroupHandler.GroupFrame[groupbit] != (int)iAssignedFrame) {
+                      verbprintf(3, "FLEX_NEXT: Group slot %d reused (old frame=%d new frame=%u), tearing down\n",
+                                 groupbit, flex->GroupHandler.GroupFrame[groupbit], iAssignedFrame);
+                      flex->GroupHandler.GroupCodes[groupbit][CAPCODES_INDEX] = 0;
+                      flex->GroupHandler.GroupFrame[groupbit] = -1;
+                      flex->GroupHandler.GroupCycle[groupbit] = -1;
                     }
                     
                     flex->GroupHandler.GroupCodes[groupbit][CAPCODES_INDEX]++;
@@ -3503,6 +3562,8 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
     }
 
     if (!json_mode) {
+      char flex_ts[32];
+      flex_local_timestamp(flex_ts, sizeof(flex_ts));
       // Build group member capcodes for the capcode field (space-separated)
       // per FLEX output format: capcode member1 member2|...
       char cap_field[1024];
@@ -3513,13 +3574,12 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
           cap_pos += snprintf(cap_field + cap_pos, sizeof(cap_field) - cap_pos,
                               " %010" PRId64, flex->GroupHandler.GroupCodes[flex_groupbit][g]);
       }
-      verbprintf(0, "FLEX_NEXT|%i/%i|%02i.%03i.%c|%s|%c%c|%1d|",
+      verbprintf(0, "FLEX_NEXT|%s|%i/%i|%02i.%03i.%c|%s|%c|",
+               flex_ts,
                flex->Sync.baud, flex->Sync.levels,
                flex->FIW.cycleno, flex->FIW.frameno, PhaseNo,
                cap_field,
-               flex->Decode.addr_type,
-               (flex_groupmessage ? 'G' : 'S'),
-               flex->Decode.type);
+               flex->Decode.addr_type);
     }
 
     // Special address handling per ARIB STD-43A Section 3.8.2.
@@ -3697,10 +3757,13 @@ page_done:
       int sv_len = (sv >> 14) & 0x7F;
       if (sv_len > 0 && sv_mw1 < PHASE_WORDS) {
         if (!json_mode) {
-          verbprintf(0, "FLEX_NEXT|%i/%i|%02i.%03i.%c|SysMsg_A%d||%1d|SYS|",
+          char flex_ts[32];
+          flex_local_timestamp(flex_ts, sizeof(flex_ts));
+          verbprintf(0, "FLEX_NEXT|%s|%i/%i|%02i.%03i.%c|SysMsg_A%d||SYS|",
+                     flex_ts,
                      flex->Sync.baud, flex->Sync.levels,
                      flex->FIW.cycleno, flex->FIW.frameno, PhaseNo,
-                     flex->biw_sysmsg_a_type, sv_type);
+                     flex->biw_sysmsg_a_type);
         }
         if (sv_type == FLEX_PAGETYPE_ALPHANUMERIC && !bch_err[sv_mw1]) {
           int sv_frag = (phaseptr[sv_mw1] >> 11) & 0x3;
