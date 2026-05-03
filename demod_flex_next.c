@@ -821,6 +821,11 @@ struct Flex_Next {
   int                         biw_sysmsg_a_type;  // BIW101 A-type (-1 = not present)
   struct Flex_OTA_Time        ota_time;            // Last known good OTA time
   char                        last_flextime[80];   // Last emitted FLEXTIME (change detection)
+  /* Piped output line prefix, built by main loop before calling parse functions.
+   * Format: "FLEX_NEXT|timestamp|baud/levels|cycle.frame.phase|capcodes|addr"
+   * Parse functions append "|TYPE|flags|message\n" to form a complete line. */
+  char                        line_prefix[1200];
+  const char                 *line_type_tag;       // Current message type tag for piped output
 };
 
 /* Emit a FLEXTIME line at level 0 with the current confirmed OTA state.
@@ -1922,9 +1927,9 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
             int out_m = is_initial ? msg_m : (slot >= 0 ? flex->FragStore.slots[slot].msg_m : -1);
             const char *k_str = k_fail ? ".K-" : ".K+";
             if (out_r >= 0)
-              verbprintf(0, "%c.%d/%d.N%d.R%d%s%s%s|%s", frag_flag, slot >= 0 ? flex->FragStore.slots[slot].frag_index : 0, frag, msg_n, out_r, out_m ? ".M" : "", k_str, grp_tag, message);
+              verbprintf(0, "%s|%s|%c.%d/%d.N%d.R%d%s%s%s|%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, slot >= 0 ? flex->FragStore.slots[slot].frag_index : 0, frag, msg_n, out_r, out_m ? ".M" : "", k_str, grp_tag, message);
             else
-              verbprintf(0, "%c.%d/%d.N%d%s%s|%s", frag_flag, slot >= 0 ? flex->FragStore.slots[slot].frag_index : 0, frag, msg_n, k_str, grp_tag, message);
+              verbprintf(0, "%s|%s|%c.%d/%d.N%d%s%s|%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, slot >= 0 ? flex->FragStore.slots[slot].frag_index : 0, frag, msg_n, k_str, grp_tag, message);
           } else {
             int out_r = is_initial ? msg_r : (slot >= 0 ? flex->FragStore.slots[slot].msg_r : -1);
             int out_m = is_initial ? msg_m : (slot >= 0 ? flex->FragStore.slots[slot].msg_m : -1);
@@ -1993,10 +1998,10 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
               const char *k_str = k_fail ? ".K-" : ".K+";
               const char *sig_str = reassembled_sig_fail ? ".SIG-" : ".SIG+";
               if (out_r >= 0)
-                verbprintf(0, "%c.%d/%d.N%d.R%d%s%s%s%s|%.*s%s", frag_flag, flex->FragStore.slots[slot].frag_index + 1, frag, msg_n, out_r, out_m ? ".M" : "", k_str, sig_str, grp_tag,
+                verbprintf(0, "%s|%s|%c.%d/%d.N%d.R%d%s%s%s%s|%.*s%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, flex->FragStore.slots[slot].frag_index + 1, frag, msg_n, out_r, out_m ? ".M" : "", k_str, sig_str, grp_tag,
                            (int)flex->FragStore.slots[slot].data_len, flex->FragStore.slots[slot].data, message);
               else
-                verbprintf(0, "%c.%d/%d.N%d%s%s%s|%.*s%s", frag_flag, flex->FragStore.slots[slot].frag_index + 1, frag, msg_n, k_str, sig_str, grp_tag,
+                verbprintf(0, "%s|%s|%c.%d/%d.N%d%s%s%s|%.*s%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, flex->FragStore.slots[slot].frag_index + 1, frag, msg_n, k_str, sig_str, grp_tag,
                            (int)flex->FragStore.slots[slot].data_len, flex->FragStore.slots[slot].data, message);
             } else {
               char reassembled[MAX_ALN * 2];
@@ -2033,7 +2038,7 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
           }
           // No buffered fragment found, output what we have
           if (!json_mode) {
-            verbprintf(0, "%c.0/%d.N%d%s%s|%s", frag_flag, frag, msg_n, k_fail ? ".K-" : ".K+", grp_tag, message);
+            verbprintf(0, "%s|%s|%c.0/%d.N%d%s%s|%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, frag, msg_n, k_fail ? ".K-" : ".K+", grp_tag, message);
           } else {
             flex_next_json_emit(flex, flex->Decode.phase, flex->Decode.capcode,
                                 flex->Decode.addr_type, flex_groupmessage, flex->Decode.type,
@@ -2055,7 +2060,7 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
           const char *dup_str = (dedup_flag == 2) ? ".DUP+" : (dedup_flag == 1) ? ".DUP" : "";
           const char *k_str = k_fail ? ".K-" : ".K+";
           const char *sig_str = sig_fail ? ".SIG-" : ".SIG+";
-          verbprintf(0, "%c.0/%d.N%d.R%d%s%s%s%s%s|%s", frag_flag, frag, msg_n, msg_r, msg_m ? ".M" : "", k_str, sig_str, dup_str, grp_tag, message);
+          verbprintf(0, "%s|%s|%c.0/%d.N%d.R%d%s%s%s%s%s|%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, frag, msg_n, msg_r, msg_m ? ".M" : "", k_str, sig_str, dup_str, grp_tag, message);
         } else {
           flex_next_json_emit(flex, flex->Decode.phase, flex->Decode.capcode,
                               flex->Decode.addr_type, flex_groupmessage, flex->Decode.type,
@@ -2192,11 +2197,6 @@ static void parse_numeric(struct Flex_Next * flex, unsigned int * phaseptr, int 
 
   // Output frag flags with N/R/M/K-/DUP
   // Numeric messages are always complete per spec.
-  if (!json_mode) {
-    const char *dup_str = (dedup_flag == 2) ? ".DUP+" : (dedup_flag == 1) ? ".DUP" : "";
-    const char *k_str = num_k_fail ? ".K-" : ".K+";
-    verbprintf(0, "3.0.K.N%d.R%d%s%s%s|", msg_n, msg_r, msg_m ? ".M" : "", k_str, dup_str);
-  }
 
   // BCD digit extraction
   char num_msg[256];
@@ -2219,15 +2219,13 @@ static void parse_numeric(struct Flex_Next * flex, unsigned int * phaseptr, int 
       dw >>= 1;
       if(--count == 0) {
         if(dw_bad) {
-          if (!json_mode) { verbprintf(0, "?"); }
-          else { if (num_pos < 255) num_msg[num_pos++] = '?'; }
+          if (num_pos < 255) num_msg[num_pos++] = '?';
         } else {
           // Output all BCD digits including space fill (0x0C).
           // Do NOT skip any digits here - the K checksum covers
           // all BCD positions in the message words, so dropping
           // characters would cause the checksum to appear wrong.
-          if (!json_mode) { verbprintf(0, "%c", flex_bcd[digit]); }
-          else { if (num_pos < 255) num_msg[num_pos++] = flex_bcd[digit]; }
+          if (num_pos < 255) num_msg[num_pos++] = flex_bcd[digit];
         }
         count = 4;
       }
@@ -2239,6 +2237,13 @@ static void parse_numeric(struct Flex_Next * flex, unsigned int * phaseptr, int 
       dw_bad = bch_err[i];
       dw = phaseptr[i];
     }
+  }
+
+  if (!json_mode) {
+    const char *dup_str = (dedup_flag == 2) ? ".DUP+" : (dedup_flag == 1) ? ".DUP" : "";
+    const char *k_str = num_k_fail ? ".K-" : ".K+";
+    num_msg[num_pos] = '\0';
+    verbprintf(0, "%s|%s|K.0/3.N%d.R%d%s%s%s|%s\n", flex->line_prefix, flex->line_type_tag, msg_n, msg_r, msg_m ? ".M" : "", k_str, dup_str, num_msg);
   }
 
   if (json_mode) {
@@ -2295,7 +2300,7 @@ static void parse_short_message(struct Flex_Next * flex, unsigned int * phaseptr
       unsigned int multiplier = (phaseptr[j] >> 14) & 0x07;
       unsigned int tmf = (phaseptr[j] >> 17) & 0x0F;
       if (!json_mode) {
-        verbprintf(0, "SMSG|NID area=%u mult=%u tmf=0x%X", area_id, multiplier, tmf);
+        verbprintf(0, "%s|SMSG|NID area=%u mult=%u tmf=0x%X\n", flex->line_prefix, area_id, multiplier, tmf);
       } else {
         cJSON *extra = cJSON_CreateObject();
         cJSON_AddStringToObject(extra, "smsg_sub_type", "network_id");
@@ -2341,7 +2346,7 @@ static void parse_short_message(struct Flex_Next * flex, unsigned int * phaseptr
     if (all_space) {
       // Pure tone-only: all digits are space fill, no data content
       if (!json_mode) {
-        verbprintf(0, "TON|");
+        verbprintf(0, "%s|TON|\n", flex->line_prefix);
       } else {
         flex_next_json_emit(flex, flex->Decode.phase, flex->Decode.capcode, flex->Decode.addr_type,
                             0, FLEX_PAGETYPE_SHORT_MESSAGE, "TON", "complete",
@@ -2350,7 +2355,7 @@ static void parse_short_message(struct Flex_Next * flex, unsigned int * phaseptr
     } else {
       // Short numeric message with actual digit content
       if (!json_mode) {
-        verbprintf(0, "SMSG|%s", digits);
+        verbprintf(0, "%s|SMSG|%s\n", flex->line_prefix, digits);
       } else {
         cJSON *extra = cJSON_CreateObject();
         cJSON_AddStringToObject(extra, "smsg_sub_type", "numeric");
@@ -2366,7 +2371,7 @@ static void parse_short_message(struct Flex_Next * flex, unsigned int * phaseptr
     // d0-d2 = S2S1S0 (source code 0-7)
     unsigned int source = (phaseptr[j] >> 9) & 0x07;
     if (!json_mode) {
-      verbprintf(0, "SMSG|SRC=%u", source);
+      verbprintf(0, "%s|SMSG|SRC=%u\n", flex->line_prefix, source);
     } else {
       cJSON *extra = cJSON_CreateObject();
       cJSON_AddStringToObject(extra, "smsg_sub_type", "source");
@@ -2388,7 +2393,7 @@ static void parse_short_message(struct Flex_Next * flex, unsigned int * phaseptr
     unsigned int msg_n  = (phaseptr[j] >> 12) & 0x3F;
     unsigned int msg_r  = (phaseptr[j] >> 18) & 0x01;
     if (!json_mode) {
-      verbprintf(0, "SMSG|S=%u N=%u R=%u", source, msg_n, msg_r);
+      verbprintf(0, "%s|SMSG|S=%u N=%u R=%u\n", flex->line_prefix, source, msg_n, msg_r);
     } else {
       cJSON *extra = cJSON_CreateObject();
       cJSON_AddStringToObject(extra, "smsg_sub_type", "numbered");
@@ -2404,7 +2409,7 @@ static void parse_short_message(struct Flex_Next * flex, unsigned int * phaseptr
   default:
     // t=11: Reserved
     if (!json_mode) {
-      verbprintf(0, "SMSG|RSVD t=%u d=0x%03X", sub_type, (phaseptr[j] >> 9) & 0xFFF);
+      verbprintf(0, "%s|SMSG|RSVD t=%u d=0x%03X\n", flex->line_prefix, sub_type, (phaseptr[j] >> 9) & 0xFFF);
     } else {
       cJSON *extra = cJSON_CreateObject();
       cJSON_AddStringToObject(extra, "smsg_sub_type", "reserved");
@@ -2700,7 +2705,7 @@ static void parse_binary(struct Flex_Next * flex, unsigned int * phaseptr, int *
     }
     // No buffered fragment, output what we have
     if (!json_mode) {
-      verbprintf(0, "%c.N%d|%s", frag_flag, msg_n, hex);
+      verbprintf(0, "%s|%s|%c.0/%d.N%d|%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, frag, msg_n, hex);
     } else {
       flex_next_json_emit(flex, flex->Decode.phase, flex->Decode.capcode, flex->Decode.addr_type,
                           0, flex->Decode.type, "HEX", "fragment_end",
@@ -2716,9 +2721,9 @@ static void parse_binary(struct Flex_Next * flex, unsigned int * phaseptr, int *
     const char *dup_str = (dedup_flag == 2) ? ".DUP+" : (dedup_flag == 1) ? ".DUP" : "";
     const char *sig_str = hex_sig_fail ? ".SIG-" : ".SIG+";
     if (is_initial_hex)
-      verbprintf(0, "%c.N%d.R%d%s%s%s|%s", frag_flag, msg_n, msg_r, msg_m ? ".M" : "", sig_str, dup_str, hex);
+      verbprintf(0, "%s|%s|%c.0/%d.N%d.R%d%s%s%s|%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, frag, msg_n, msg_r, msg_m ? ".M" : "", sig_str, dup_str, hex);
     else
-      verbprintf(0, "%c.N%d%s%s|%s", frag_flag, msg_n, sig_str, dup_str, hex);
+      verbprintf(0, "%s|%s|%c.0/%d.N%d%s%s|%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, frag, msg_n, sig_str, dup_str, hex);
   } else {
     cJSON *extra = NULL;
     if (hex_has_sig) {
@@ -3668,7 +3673,9 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
           cap_pos += snprintf(cap_field + cap_pos, sizeof(cap_field) - cap_pos,
                               " %010" PRId64, flex->GroupHandler.GroupCodes[flex_groupbit][g]);
       }
-      verbprintf(0, "FLEX_NEXT|%s|%i/%i|%02i.%03i.%c|%s|%c|",
+      // Build line prefix into flex->line_prefix for atomic output by parse functions
+      snprintf(flex->line_prefix, sizeof(flex->line_prefix),
+               "FLEX_NEXT|%s|%i/%i|%02i.%03i.%c|%s|%c",
                flex_ts,
                flex->Sync.baud, flex->Sync.levels,
                flex->FIW.cycleno, flex->FIW.frameno, PhaseNo,
@@ -3693,7 +3700,7 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
       unsigned int zones   = (net_mw >> 6) & 0x1F;
       unsigned int traffic = (net_mw >> 11) & 0x3FF;
       if (!json_mode) {
-        verbprintf(0, "NET|area=%u zones=%u traffic=0x%03X\n", area_id, zones, traffic);
+        verbprintf(0, "%s|NET|area=%u zones=%u traffic=0x%03X\n", flex->line_prefix, area_id, zones, traffic);
       } else {
         cJSON *json = cJSON_CreateObject();
         if (json) {
@@ -3736,16 +3743,19 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
       else if (lsb == 0xE) cat = "SSIDChange";
       else if (lsb == 0xF) cat = "SysEvent";
       flex->Decode.opr_category = cat;
-      if (!json_mode) verbprintf(0, "OPR/%s|", cat);
+      if (!json_mode) {
+        char opr_tag[32];
+        snprintf(opr_tag, sizeof(opr_tag), "OPR/%s", cat);
+        flex->line_type_tag = opr_tag;
+      }
       // Fall through to normal message decode for body content
     }
 
     // Info Service Address (Section 3.8.2, under study):
     // No defined protocol yet.  Log raw hex payload.
     if (flex->Decode.addr_type == 'I') {
-      if (!json_mode) verbprintf(0, "ISV|");
+      flex->line_type_tag = "ISV";
       parse_binary(flex, decode_words, decode_errs, mw1, len, frag, cont, msg_n, msg_r, msg_m, dedup_flag);
-      if (!json_mode) verbprintf(0, "\n");
       goto page_done;
     }
 
@@ -3767,7 +3777,7 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
     //   V=111 (7): Numbered Numeric - BCD with message number
     switch (flex->Decode.type) {
     case FLEX_PAGETYPE_ALPHANUMERIC:
-      if (!json_mode) verbprintf(0, "ALN|");
+      flex->line_type_tag = "ALN";
       parse_alphanumeric(flex, decode_words, decode_errs, hdr, mw1, len, frag, cont, msg_n, msg_r, msg_m, dedup_flag, flex_groupmessage, flex_groupbit);
       break;
     case FLEX_PAGETYPE_SECURE: {
@@ -3784,47 +3794,51 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
       }
       if (sec_t == 0) {
         // t=00: alphanumeric content - decode like alpha
-        if (!json_mode) verbprintf(0, "SEC|");
+        flex->line_type_tag = "SEC";
         flex->Decode.sec_subtype = "alpha";
         parse_alphanumeric(flex, decode_words, decode_errs, hdr, mw1, len, frag, cont, msg_n, msg_r, msg_m, dedup_flag, flex_groupmessage, flex_groupbit);
       } else if (sec_t == 2) {
         // t=10: binary data
-        if (!json_mode) verbprintf(0, "SEC:BIN|");
+        flex->line_type_tag = "SEC:BIN";
         flex->Decode.sec_subtype = "binary";
         parse_binary(flex, decode_words, decode_errs, mw1, len, frag, cont, msg_n, msg_r, msg_m, dedup_flag);
       } else {
         // t=01, t=11, or unknown: dump as hex
-        if (!json_mode) verbprintf(0, "SEC:t%d|", sec_t >= 0 ? sec_t : -1);
+        {
+          static char sec_tag[16];
+          snprintf(sec_tag, sizeof(sec_tag), "SEC:t%d", sec_t >= 0 ? sec_t : -1);
+          flex->line_type_tag = sec_tag;
+        }
         flex->Decode.sec_subtype = (sec_t == 1) ? "vendor" : "reserved";
         parse_binary(flex, decode_words, decode_errs, mw1, len, frag, cont, msg_n, msg_r, msg_m, dedup_flag);
       }
       break;
     }
     case FLEX_PAGETYPE_STANDARD_NUMERIC:
-      if (!json_mode) verbprintf(0, "NUM|");
+      flex->line_type_tag = "NUM";
       parse_numeric(flex, decode_words, decode_errs, j, frag, cont, msg_n, msg_r, msg_m, dedup_flag);
       break;
     case FLEX_PAGETYPE_SPECIAL_NUMERIC:
-      if (!json_mode) verbprintf(0, "SNUM|");
+      flex->line_type_tag = "SNUM";
       parse_numeric(flex, decode_words, decode_errs, j, frag, cont, msg_n, msg_r, msg_m, dedup_flag);
       break;
     case FLEX_PAGETYPE_NUMBERED_NUMERIC:
-      if (!json_mode) verbprintf(0, "NNUM|");
+      flex->line_type_tag = "NNUM";
       parse_numeric(flex, decode_words, decode_errs, j, frag, cont, msg_n, msg_r, msg_m, dedup_flag);
       break;
     case FLEX_PAGETYPE_SHORT_MESSAGE:
+      flex->line_type_tag = "SMSG";
       parse_short_message(flex, decode_words, decode_errs, j);
       break;
     case FLEX_PAGETYPE_BINARY:
-      if (!json_mode) verbprintf(0, "HEX|");
+      flex->line_type_tag = "HEX";
       parse_binary(flex, decode_words, decode_errs, mw1, len, frag, cont, msg_n, msg_r, msg_m, dedup_flag);
       break;
     default:
-      if (!json_mode) verbprintf(0, "UNK|");
+      flex->line_type_tag = "UNK";
       parse_binary(flex, decode_words, decode_errs, mw1, len, frag, cont, msg_n, msg_r, msg_m, dedup_flag);
       break;
     }
-    if (!json_mode) verbprintf(0, "\n");
 
 page_done:
     // long addresses eat 2 aw and 2 vw, so skip the next aw-vw pair
@@ -3853,11 +3867,12 @@ page_done:
         if (!json_mode) {
           char flex_ts[32];
           flex_local_timestamp(flex_ts, sizeof(flex_ts));
-          verbprintf(0, "FLEX_NEXT|%s|%i/%i|%02i.%03i.%c|SysMsg_A%d||SYS|",
-                     flex_ts,
-                     flex->Sync.baud, flex->Sync.levels,
-                     flex->FIW.cycleno, flex->FIW.frameno, PhaseNo,
-                     flex->biw_sysmsg_a_type);
+          snprintf(flex->line_prefix, sizeof(flex->line_prefix),
+                   "FLEX_NEXT|%s|%i/%i|%02i.%03i.%c|SysMsg_A%d|",
+                   flex_ts,
+                   flex->Sync.baud, flex->Sync.levels,
+                   flex->FIW.cycleno, flex->FIW.frameno, PhaseNo,
+                   flex->biw_sysmsg_a_type);
         }
         if (sv_type == FLEX_PAGETYPE_ALPHANUMERIC && !bch_err[sv_mw1]) {
           int sv_frag = (phaseptr[sv_mw1] >> 11) & 0x3;
@@ -3868,15 +3883,14 @@ page_done:
           int sv_hdr = sv_mw1;
           sv_mw1++;
           if (sv_len > 0) sv_len--;
-          if (!json_mode) verbprintf(0, "ALN|");
+          flex->line_type_tag = "SYS:ALN";
           parse_alphanumeric(flex, phaseptr, bch_err, sv_hdr, sv_mw1, sv_len, sv_frag, sv_cont, sv_msg_n, sv_msg_r, sv_msg_m, 0, 0, 0);
         } else {
           int sv_frag = 3;
           int sv_cont = 0;
-          if (!json_mode) verbprintf(0, "SEC|");
+          flex->line_type_tag = "SYS:SEC";
           parse_binary(flex, phaseptr, bch_err, sv_mw1, sv_len, sv_frag, sv_cont, -1, -1, -1, 0);
         }
-        if (!json_mode) verbprintf(0, "\n");
       }
     }
   }
