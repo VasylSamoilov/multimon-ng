@@ -536,8 +536,33 @@ static int flextime_date_valid(unsigned int year, unsigned int mon, unsigned int
 static void flex_local_timestamp(char *buf, size_t bufsz) {
   time_t now = time(NULL);
   struct tm lt;
+#ifdef _WIN32
+  localtime_s(&lt, &now);
+#else
   localtime_r(&now, &lt);
-  int off = (int)lt.tm_gmtoff;
+#endif
+  /* Compute UTC offset in seconds.
+   * tm_gmtoff is a GNU/BSD extension; on Windows we compute it
+   * from the difference between local and UTC representations. */
+  int off;
+#if defined(__GLIBC__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__)
+  off = (int)lt.tm_gmtoff;
+#else
+  {
+    struct tm gt;
+#ifdef _WIN32
+    gmtime_s(&gt, &now);
+#else
+    gmtime_r(&now, &gt);
+#endif
+    int local_min = lt.tm_hour * 60 + lt.tm_min;
+    int utc_min = gt.tm_hour * 60 + gt.tm_min;
+    int day_diff = lt.tm_yday - gt.tm_yday;
+    if (day_diff > 1) day_diff = -1;
+    if (day_diff < -1) day_diff = 1;
+    off = (local_min - utc_min + day_diff * 1440) * 60;
+  }
+#endif
   char sign = off >= 0 ? '+' : '-';
   if (off < 0) off = -off;
   int off_h = off / 3600;
