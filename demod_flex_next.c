@@ -834,6 +834,18 @@ static void flextime_emit(struct Flex_Next *flex, char phase) {
   char flex_ts[32];
   flex_local_timestamp(flex_ts, sizeof(flex_ts));
 
+  /* Build flags: D+/D-.T+/T-.TZ+/TZ-[.P75/.P09] */
+  char flags[32];
+  int fpos = 0;
+  fpos += snprintf(flags + fpos, sizeof(flags) - fpos, "D%c.T%c.TZ%c",
+                   ot->has_date ? '+' : '-',
+                   ot->has_time ? '+' : '-',
+                   ot->has_tz ? '+' : '-');
+  if (ot->has_time)
+    fpos += snprintf(flags + fpos, sizeof(flags) - fpos, ".P%s",
+                     ot->has_tz ? "09" : "75");
+
+  /* Build OTA timestamp value */
   char ota[80];
   int pos = 0;
 
@@ -869,11 +881,11 @@ static void flextime_emit(struct Flex_Next *flex, char phase) {
     return;
   memcpy(flex->last_flextime, ota, sizeof(flex->last_flextime));
 
-  verbprintf(0, "FLEX_NEXT|%s|%i/%i|%02u.%03u.%c|FLEXTIME|%s\n",
+  verbprintf(0, "FLEX_NEXT|%s|%i/%i|%02u.%03u.%c|0000000000|B|FLEXTIME|%s|%s\n",
              flex_ts,
              flex->Sync.baud, flex->Sync.levels,
              flex->FIW.cycleno, flex->FIW.frameno, phase,
-             ota);
+             flags, ota);
 }
 
 
