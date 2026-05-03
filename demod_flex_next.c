@@ -217,6 +217,9 @@ struct Flex_GroupHandler {
   int64_t                     GroupCodes[GROUP_BITS][1000];
   int                         GroupCycle[GROUP_BITS];
   int                         GroupFrame[GROUP_BITS];
+  int                         GroupDelivering[GROUP_BITS]; // 1 = delivery in progress (fragments)
+  unsigned int                GroupLastFragFrame[GROUP_BITS]; // abs frame of last fragment received
+  int                         GroupTimeoutCount[GROUP_BITS]; // consecutive FIWs past deadline
 };
 
 struct Flex_Modulation {
@@ -1300,6 +1303,28 @@ static int decode_fiw(struct Flex_Next * flex) {
       // Do we have a group message pending for this groupbit?
       if(flex->GroupHandler.GroupFrame[g] >= 0)
       {
+        /* Check delivering groups for fragment timeout.
+         * Require 2 consecutive FIWs past the deadline to avoid
+         * false timeouts from a single erroneous FIW. */
+        if (flex->GroupHandler.GroupDelivering[g]) {
+          unsigned int cur_abs = flex->FIW.cycleno * 128 + flex->FIW.frameno;
+          unsigned int last_frag = flex->GroupHandler.GroupLastFragFrame[g];
+          unsigned int age = (cur_abs - last_frag) & 0x7FF; /* wrap-safe */
+          if (age > FLEX_FRAG_TIMEOUT) {
+            flex->GroupHandler.GroupTimeoutCount[g]++;
+            if (flex->GroupHandler.GroupTimeoutCount[g] >= 2) {
+              verbprintf(3, "FLEX_NEXT: Group %d fragment delivery timeout (age=%u frames)\n", g, age);
+              flex->GroupHandler.GroupCodes[g][CAPCODES_INDEX] = 0;
+              flex->GroupHandler.GroupFrame[g] = -1;
+              flex->GroupHandler.GroupCycle[g] = -1;
+              flex->GroupHandler.GroupDelivering[g] = 0;
+              flex->GroupHandler.GroupTimeoutCount[g] = 0;
+            }
+          } else {
+            flex->GroupHandler.GroupTimeoutCount[g] = 0;
+          }
+          continue;
+        }
         int Reset = 0;
         verbprintf(4, "FLEX_NEXT: GroupBit %i, FrameNo: %i, Cycle No: %i target Cycle No: %i\n", g, flex->GroupHandler.GroupFrame[g], flex->GroupHandler.GroupCycle[g], (int)flex->FIW.cycleno); 
         // Now lets check if its expected in this frame..
@@ -1364,6 +1389,7 @@ static int decode_fiw(struct Flex_Next * flex) {
                       flex->GroupHandler.GroupCodes[g][CAPCODES_INDEX] = 0;
                       flex->GroupHandler.GroupFrame[g] = -1;
                       flex->GroupHandler.GroupCycle[g] = -1;
+                      flex->GroupHandler.GroupDelivering[g] = 0;
         }
       }
                 }
@@ -1947,13 +1973,13 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
           if (slot >= 0)
             verbprintf(3, "FLEX_NEXT: Buffered fragment for cap %" PRId64 " (%d bytes in slot %d)\n",
                        flex->Decode.capcode, flex->FragStore.slots[slot].data_len, slot);
-          /* Keep group alive while fragments are arriving.
-           * Only bump if we're past the delivery frame (timeout would fire). */
+          /* Mark group as delivering so the FIW timeout check skips it.
+           * Cleared on teardown when the message completes (C=0). */
           if (flex_groupmessage && flex_groupbit >= 0 && flex_groupbit < GROUP_BITS &&
-              flex->GroupHandler.GroupFrame[flex_groupbit] >= 0 &&
-              flex->GroupHandler.GroupFrame[flex_groupbit] < (int)flex->FIW.frameno) {
-            flex->GroupHandler.GroupFrame[flex_groupbit] = (int)flex->FIW.frameno;
-            flex->GroupHandler.GroupCycle[flex_groupbit] = (int)flex->FIW.cycleno;
+              flex->GroupHandler.GroupFrame[flex_groupbit] >= 0) {
+            flex->GroupHandler.GroupDelivering[flex_groupbit] = 1;
+            flex->GroupHandler.GroupLastFragFrame[flex_groupbit] = flex->FIW.cycleno * 128 + flex->FIW.frameno;
+            flex->GroupHandler.GroupTimeoutCount[flex_groupbit] = 0;
           }
           return;
         }
@@ -2023,6 +2049,7 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
               flex->GroupHandler.GroupCodes[flex_groupbit][CAPCODES_INDEX] = 0;
               flex->GroupHandler.GroupFrame[flex_groupbit] = -1;
               flex->GroupHandler.GroupCycle[flex_groupbit] = -1;
+              flex->GroupHandler.GroupDelivering[flex_groupbit] = 0;
             }
             return;
           }
@@ -2041,6 +2068,7 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
             flex->GroupHandler.GroupCodes[flex_groupbit][CAPCODES_INDEX] = 0;
             flex->GroupHandler.GroupFrame[flex_groupbit] = -1;
             flex->GroupHandler.GroupCycle[flex_groupbit] = -1;
+            flex->GroupHandler.GroupDelivering[flex_groupbit] = 0;
           }
           return;
         }
@@ -2076,6 +2104,7 @@ group_output:
                 flex->GroupHandler.GroupCodes[flex_groupbit][CAPCODES_INDEX] = 0;
                 flex->GroupHandler.GroupFrame[flex_groupbit] = -1;
                 flex->GroupHandler.GroupCycle[flex_groupbit] = -1;
+                flex->GroupHandler.GroupDelivering[flex_groupbit] = 0;
                 verbprintf(3, "FLEX_NEXT: Group teardown after delivery: groupbit=%d\n", flex_groupbit);
         } 
 }
@@ -3433,15 +3462,18 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
                     }
 
                     /* If this group slot is already active with a different
-                     * delivery frame, tear it down first to avoid mixing
-                     * capcodes from different group setups. */
+                     * delivery frame, or is mid-delivery, tear it down first. */
                     if (flex->GroupHandler.GroupFrame[groupbit] >= 0 &&
-                        flex->GroupHandler.GroupFrame[groupbit] != (int)iAssignedFrame) {
-                      verbprintf(3, "FLEX_NEXT: Group slot %d reused (old frame=%d new frame=%u), tearing down\n",
-                                 groupbit, flex->GroupHandler.GroupFrame[groupbit], iAssignedFrame);
+                        (flex->GroupHandler.GroupFrame[groupbit] != (int)iAssignedFrame ||
+                         flex->GroupHandler.GroupDelivering[groupbit])) {
+                      verbprintf(3, "FLEX_NEXT: Group slot %d reused (old frame=%d new frame=%u delivering=%d), tearing down\n",
+                                 groupbit, flex->GroupHandler.GroupFrame[groupbit], iAssignedFrame,
+                                 flex->GroupHandler.GroupDelivering[groupbit]);
                       flex->GroupHandler.GroupCodes[groupbit][CAPCODES_INDEX] = 0;
                       flex->GroupHandler.GroupFrame[groupbit] = -1;
                       flex->GroupHandler.GroupCycle[groupbit] = -1;
+                      flex->GroupHandler.GroupDelivering[groupbit] = 0;
+                      flex->GroupHandler.GroupTimeoutCount[groupbit] = 0;
                     }
                     
                     flex->GroupHandler.GroupCodes[groupbit][CAPCODES_INDEX]++;
@@ -4667,6 +4699,7 @@ static struct Flex_Next * Flex_New(unsigned int SampleFrequency) {
     {
       flex->GroupHandler.GroupFrame[g] = -1;
           flex->GroupHandler.GroupCycle[g] = -1;
+          flex->GroupHandler.GroupDelivering[g] = 0;
     }
   }
 
