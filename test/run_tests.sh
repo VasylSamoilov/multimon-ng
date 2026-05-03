@@ -78,13 +78,13 @@ run_test "POCSAG2400" "POCSAG2400" "flac" "$SAMPLES_DIR/POCSAG_sample_-_2400_bps
 #        instruction messages (INS), group/tagged messages (TG),
 #        K checksum, signature validation
 run_test "FLEX_NEXT 1600/2FSK P2000 proef-alarm" "FLEX_NEXT" "flac" "$SAMPLES_DIR/FLEX_1600_2fsk_P2000_proef_alarm.flac" \
-    "FLEX_NEXT|1600/2|14.116.A|0001120103|SS|5|ALN|3.0.K.N0.R0.K+.SIG+|test" \
-    "FLEX_NEXT|1600/2|00.012.A|0001180000|SS|5|ALN|3.0.K.N0.R0.K+.SIG+|TESTOPROEP MOB" \
-    "FLEX_NEXT|1600/2|00.012.A|0001400521|SS|5|ALN|3.0.K.N0.R0.K+.SIG+|Test: Proefalarm Ochtend Brandweer Veiligheidsregio Rotterdam Rijnmond." \
-    "FLEX_NEXT|1600/2|00.013.A|0001400141|SS|5|ALN|0.0.C.N0.R0.K+.SIG+|Test: Proefalarm Ochtend Brandweer Veiligheidsregio Rotterdam Rijnmond." \
-    "FLEX_NEXT|1600/2|00.039.A|0001420033|SS|1|INS|i=0 frame=40 group=4" \
-    "FLEX_NEXT|1600/2|00.040.A|0002029572 0001420033 0001420999|TG|5|ALN|3.0.K.N0.R0.K+.SIG+|A2 (DIA: ja) AMBU 17133" \
-    "FLEX_NEXT|1600/2|00.038.A|0001123201|SS|5|ALN|3.0.K.N0.R0.K+.SIG+|B2 Eindhoven Rit: 105012" \
+    "1600/2|14.116.A|0001120103|S|ALN|K.0/3.N0.R0.K+.SIG+|test" \
+    "1600/2|00.012.A|0001180000|S|ALN|K.0/3.N0.R0.K+.SIG+|TESTOPROEP MOB" \
+    "1600/2|00.012.A|0001400521|S|ALN|K.0/3.N0.R0.K+.SIG+|Test: Proefalarm Ochtend Brandweer Veiligheidsregio Rotterdam Rijnmond." \
+    "1600/2|00.013.A|0001400141|S|ALN|C.1/0.N0.R0.K+.SIG+|Test: Proefalarm Ochtend Brandweer Veiligheidsregio Rotterdam Rijnmond." \
+    "1600/2|00.039.A|0001420033|S|INS|assign_group=4 deliver_frame=40" \
+    "1600/2|00.040.A|0002029572 0001420033 0001420999|T|ALN|K.0/3.N0.R0.K+.SIG+.G4|A2 (DIA: ja) AMBU 17133" \
+    "1600/2|00.038.A|0001123201|S|ALN|K.0/3.N0.R0.K+.SIG+|B2 Eindhoven Rit: 105012" \
     || FAILED=1
 
 

@@ -795,7 +795,61 @@ struct Flex_Next {
   struct Flex_DedupStore     DedupStore;
   int                         biw_sysmsg_a_type;  // BIW101 A-type (-1 = not present)
   struct Flex_OTA_Time        ota_time;            // Last known good OTA time
+  char                        last_flextime[80];   // Last emitted FLEXTIME (change detection)
 };
+
+/* Emit a FLEXTIME line at level 0 with the current confirmed OTA state.
+ * Called each time a flextime component is promoted (vote threshold reached).
+ * Shows the full snapshot: whatever date/time/tz components are confirmed. */
+static void flextime_emit(struct Flex_Next *flex, char phase) {
+  struct Flex_OTA_Time *ot = &flex->ota_time;
+  if (!ot->has_date && !ot->has_time && !ot->has_tz)
+    return;
+
+  char flex_ts[32];
+  flex_local_timestamp(flex_ts, sizeof(flex_ts));
+
+  char ota[80];
+  int pos = 0;
+
+  if (ot->has_date) {
+    pos += snprintf(ota + pos, sizeof(ota) - pos, "%04u-%02u-%02u",
+                    ot->year, ot->month, ot->day);
+  }
+  if (ot->has_time) {
+    double sec;
+    if (ot->has_tz) {
+      unsigned int combined = (ot->sec_ext << 3) | ot->sec_coarse;
+      sec = combined * 0.9375;
+    } else {
+      sec = ot->sec_coarse * 7.5;
+    }
+    if (pos > 0) ota[pos++] = ' ';
+    pos += snprintf(ota + pos, sizeof(ota) - pos, "%02u:%02u:%05.2f",
+                    ot->hour, ot->min, sec);
+  }
+  if (ot->has_tz) {
+    int off = ot->tz_offset_min;
+    const char *dst_str = ot->tz_dst ? "" : " DST";
+    int abs_off = off < 0 ? -off : off;
+    if (pos > 0) ota[pos++] = ' ';
+    if (abs_off % 60 == 0)
+      pos += snprintf(ota + pos, sizeof(ota) - pos, "%+dh%s", off / 60, dst_str);
+    else
+      pos += snprintf(ota + pos, sizeof(ota) - pos, "%+dh%02dm%s", off / 60, abs_off % 60, dst_str);
+  }
+
+  /* Only emit if the OTA string changed since last emission */
+  if (strcmp(ota, flex->last_flextime) == 0)
+    return;
+  memcpy(flex->last_flextime, ota, sizeof(flex->last_flextime));
+
+  verbprintf(0, "FLEX_NEXT|%s|%i/%i|%02u.%03u.%c|FLEXTIME|%s\n",
+             flex_ts,
+             flex->Sync.baud, flex->Sync.levels,
+             flex->FIW.cycleno, flex->FIW.frameno, phase,
+             ota);
+}
 
 
 // Identify address type from the raw address word value (before capcode conversion).
@@ -2818,7 +2872,8 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
           // Validate fields - month 0 or day 0 indicates corrupt data
           if (mon >= 1 && mon <= 12 && day >= 1 && day <= 31) {
             unsigned int abs_frame = flex->FIW.cycleno * 128 + flex->FIW.frameno;
-            flextime_vote_date(&flex->ota_time, year, mon, day, abs_frame);
+            if (flextime_vote_date(&flex->ota_time, year, mon, day, abs_frame))
+              flextime_emit(flex, PhaseNo);
           } else {
             verbprintf(3, "FLEX_NEXT: BIW DATE out of range: year=%u mon=%u day=%u, discarding\n", year, mon, day);
             break;
@@ -2860,8 +2915,9 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
           // Validate range, then submit to voting with FIW cross-validation
           if (hour <= 23 && min <= 59 && sec <= 7) {
             unsigned int abs_frame = flex->FIW.cycleno * 128 + flex->FIW.frameno;
-            flextime_vote_time(&flex->ota_time, hour, min, sec,
-                               flex->FIW.cycleno, flex->FIW.frameno, abs_frame);
+            if (flextime_vote_time(&flex->ota_time, hour, min, sec,
+                               flex->FIW.cycleno, flex->FIW.frameno, abs_frame))
+              flextime_emit(flex, PhaseNo);
           } else {
             verbprintf(3, "FLEX_NEXT: BIW TIME out of range: hour=%u min=%u sec=%u, discarding\n", hour, min, sec);
             break;
@@ -2918,8 +2974,9 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
             // Submit to voting -- requires 3 identical readings
             {
               unsigned int abs_frame = flex->FIW.cycleno * 128 + flex->FIW.frameno;
-              flextime_vote_tz(&flex->ota_time, zone, (int)dst, esec, tz_min,
-                              flex->FIW.cycleno, flex->FIW.frameno, abs_frame);
+              if (flextime_vote_tz(&flex->ota_time, zone, (int)dst, esec, tz_min,
+                              flex->FIW.cycleno, flex->FIW.frameno, abs_frame))
+                flextime_emit(flex, PhaseNo);
             }
           } else {
             verbprintf(3, "FLEX_NEXT: BIW SYSINFO: A=%u I=0x%03X (phase %c)\n", a_type, info, PhaseNo);
