@@ -407,29 +407,71 @@ static const int flex_tz_table[32] = {
  * has_* flags track which components have been received at least once.
  * received_at_* stores gettimeofday() timestamp (microsecond precision)
  * when each component was last received.
- * frame_* stores the absolute frame number (cycle*128+frame) for age calc. */
+ * frame_* stores the absolute frame number (cycle*128+frame) for age calc.
+ *
+ * Consistency voting: each component uses a history ring of recent BIW
+ * readings.  Garbage from corrupted BCH words is random and won't cluster,
+ * while the real value will appear repeatedly.  A component is "confirmed"
+ * when FLEX_VOTE_THRESHOLD out of the last FLEX_VOTE_RING entries agree.
+ *
+ * - Time: validated against FIW-derived minute first (rejects obvious
+ *         garbage), then must appear forward-ticking in the ring.
+ * - Date: must be a valid calendar date, then must match or advance
+ *         relative to the majority in the ring.  Garbage dates are
+ *         random and won't form a cluster.
+ * - Timezone: zone+DST must be identical across FLEX_VOTE_THRESHOLD
+ *         entries in the ring.  Extended seconds (esec) may tick but
+ *         zone+DST must agree.
+ */
+#define FLEX_VOTE_THRESHOLD 3
+#define FLEX_VOTE_RING      8  /* history ring depth -- must be >= threshold */
+
 struct Flex_OTA_Time {
-  /* BIW type 001: Date */
+  /* BIW type 001: Date -- confirmed (promoted after voting) */
   int has_date;
-  unsigned int year;       // 1994 + raw 5-bit value
+  unsigned int year;       // 1994 + raw 5-bit value, corrected for 32-year rollover
   unsigned int month;      // 1-12
   unsigned int day;        // 1-31
   unsigned int frame_date; // cycle*128+frame when date was received (0-1919)
 
-  /* BIW type 010: Time (coarse, 7.5s resolution) */
+  /* BIW type 010: Time (coarse, 7.5s resolution) -- confirmed */
   int has_time;
   unsigned int hour;       // 0-23
   unsigned int min;        // 0-59
   unsigned int sec_coarse; // 0-7 (S2-S0, each unit = 7.5 seconds)
   unsigned int frame_time; // cycle*128+frame when time was received (0-1919)
 
-  /* BIW type 101 A=4/8: Timezone, DST, extended seconds */
+  /* BIW type 101 A=4/8: Timezone, DST, extended seconds -- confirmed */
   int has_tz;
   unsigned int tz_zone;    // 0-31 (5-bit zone code)
   int tz_offset_min;       // UTC offset in minutes (from lookup table)
   int tz_dst;              // 0=DST active, 1=standard time (per spec)
   unsigned int sec_ext;    // 0-7 (S5-S3, extends seconds to 0.9375s resolution)
   unsigned int frame_tz;   // cycle*128+frame when tz was received (0-1919)
+
+  /* --- Voting state for time --- */
+  int          vote_time_count;    // consecutive valid forward-ticking readings
+  unsigned int vote_time_hour;     // last candidate hour
+  unsigned int vote_time_min;      // last candidate minute
+  unsigned int vote_time_sec;      // last candidate sec_coarse
+
+  /* --- Voting state for date: history ring ---
+   * Stores recent BIW date readings.  The real date is either static
+   * or transitions day -> day+1 at midnight.  Garbage is random. */
+  int          date_ring_count;                // entries stored (0..FLEX_VOTE_RING)
+  int          date_ring_idx;                  // next write position
+  unsigned int date_ring_year[FLEX_VOTE_RING];
+  unsigned int date_ring_month[FLEX_VOTE_RING];
+  unsigned int date_ring_day[FLEX_VOTE_RING];
+
+  /* --- Voting state for timezone: history ring ---
+   * Zone and DST must be identical to count as agreeing.
+   * esec ticks but zone+DST identify the timezone. */
+  int          tz_ring_count;                  // entries stored (0..FLEX_VOTE_RING)
+  int          tz_ring_idx;                    // next write position
+  unsigned int tz_ring_zone[FLEX_VOTE_RING];
+  int          tz_ring_dst[FLEX_VOTE_RING];
+  unsigned int tz_ring_esec[FLEX_VOTE_RING];   // stored for promotion
 };
 
 /* Frame space: 15 cycles x 128 frames = 1920 frames per full hour cycle.
@@ -445,17 +487,280 @@ static unsigned int flextime_age_frames(unsigned int cur, unsigned int stored) {
 }
 
 /* Expire stale flextime components.  Called before emitting JSON.
- * If a component's age exceeds FLEX_FLEXTIME_EXPIRE, invalidate it. */
+ * If a component's age exceeds FLEX_FLEXTIME_EXPIRE, invalidate it.
+ * Also resets the corresponding vote streak so stale data doesn't
+ * carry over if the component reappears later. */
 static void flextime_expire(struct Flex_OTA_Time *ot, unsigned int cur_frame) {
   if (ot->has_date && flextime_age_frames(cur_frame, ot->frame_date) >= FLEX_FLEXTIME_EXPIRE) {
     ot->has_date = 0;
+    ot->date_ring_count = 0;
+    ot->date_ring_idx = 0;
   }
   if (ot->has_time && flextime_age_frames(cur_frame, ot->frame_time) >= FLEX_FLEXTIME_EXPIRE) {
     ot->has_time = 0;
+    ot->vote_time_count = 0;
   }
   if (ot->has_tz && flextime_age_frames(cur_frame, ot->frame_tz) >= FLEX_FLEXTIME_EXPIRE) {
     ot->has_tz = 0;
+    ot->tz_ring_count = 0;
+    ot->tz_ring_idx = 0;
   }
+}
+
+/* Convert hour:minute to minutes-since-midnight for easy comparison. */
+static inline int flextime_hhmm_to_min(unsigned int h, unsigned int m) {
+  return (int)(h * 60 + m);
+}
+
+/* Validate that a date is a real calendar date (days-in-month, leap year).
+ * Basic range checks (mon 1-12, day 1-31) are done by the caller before
+ * this function is reached.  This catches things like Feb 30, Apr 31, etc. */
+static int flextime_date_valid(unsigned int year, unsigned int mon, unsigned int day) {
+  static const unsigned int days_in_month[13] = {
+    0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+  };
+  if (mon < 1 || mon > 12 || day < 1)
+    return 0;
+  unsigned int max_day = days_in_month[mon];
+  if (mon == 2) {
+    /* Leap year: divisible by 4, except centuries unless divisible by 400 */
+    if ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0))
+      max_day = 29;
+  }
+  return day <= max_day;
+}
+
+/* Cross-validate a single BIW reading against the FIW-derived minute.
+ * The FIW minute is computed fresh from cycle/frame -- it's the ground truth.
+ * The BIW minute is the incoming reading we're checking.
+ * Returns 1 if they agree within +/-tolerance, handling the :59/:00 wrap. */
+#define FLEX_TIME_CROSS_TOLERANCE 2  /* minutes */
+
+static int flextime_fiw_validate(unsigned int biw_min,
+                                 unsigned int cycleno, unsigned int frameno) {
+  int fiw_seconds = (int)(cycleno * 240 + frameno * 240 / 128);
+  int fiw_min = fiw_seconds / 60;  /* 0-59 within the hour */
+  int diff = (int)biw_min - fiw_min;
+  /* Handle wrap at the hour boundary (e.g. BIW=59, FIW=1 or vice versa) */
+  if (diff > 30) diff -= 60;
+  if (diff < -30) diff += 60;
+  if (diff < 0) diff = -diff;
+  return diff <= FLEX_TIME_CROSS_TOLERANCE;
+}
+
+/* Vote on a BIW TIME reading.  Processing order:
+ *
+ *  1. Validate the new BIW reading against the FIW-derived minute.
+ *     The FIW is computed from cycle/frame and is the independent
+ *     ground truth.  At hour boundaries the BIW minute can be off
+ *     by up to +/-FLEX_TIME_CROSS_TOLERANCE from the FIW minute
+ *     (e.g. BIW=59 while FIW wrapped to 0, or BIW=0 while FIW
+ *     is still at 59).  If it fails, reject and reset.
+ *
+ *  2. Check the new BIW reading against the BIW history for
+ *     forward-ticking consistency (time must stay same or advance).
+ *     A backward jump across midnight (23:xx -> 0:xx) is allowed.
+ *     If it goes backward otherwise, reset the vote streak.
+ *
+ *  3. Store the reading in the BIW history ring and advance the
+ *     vote count.  Promote to confirmed after FLEX_VOTE_THRESHOLD
+ *     consecutive valid readings.
+ *
+ * Returns 1 if the reading was promoted (vote count reached threshold). */
+static int flextime_vote_time(struct Flex_OTA_Time *ot,
+                              unsigned int hour, unsigned int min, unsigned int sec,
+                              unsigned int cycleno, unsigned int frameno,
+                              unsigned int cur_abs_frame) {
+  /* Step 1: validate new BIW reading against FIW-derived minute */
+  if (!flextime_fiw_validate(min, cycleno, frameno)) {
+    int fiw_seconds = (int)(cycleno * 240 + frameno * 240 / 128);
+    verbprintf(3, "FLEX_NEXT: flextime TIME FIW cross-check failed: BIW %02u:%02u vs FIW min %d, resetting vote\n",
+               hour, min, fiw_seconds / 60);
+    ot->vote_time_count = 0;
+    return 0;
+  }
+
+  /* Step 2: check forward-ticking against previous BIW candidate */
+  if (ot->vote_time_count > 0) {
+    int prev = flextime_hhmm_to_min(ot->vote_time_hour, ot->vote_time_min);
+    int curr = flextime_hhmm_to_min(hour, min);
+    int delta = curr - prev;
+    /* Midnight wrap: prev=23:5x curr=0:0x -> delta ~ -1430, treat as forward */
+    if (delta < -720) delta += 1440;
+    if (delta < 0) {
+      /* Time went backward (not a midnight wrap) -- reset streak */
+      verbprintf(3, "FLEX_NEXT: flextime TIME went backward: %02u:%02u -> %02u:%02u, resetting vote\n",
+                 ot->vote_time_hour, ot->vote_time_min, hour, min);
+      ot->vote_time_count = 0;
+      /* Fall through to start a new streak with this reading */
+    }
+  }
+
+  /* Step 3: record candidate and advance vote */
+  ot->vote_time_hour = hour;
+  ot->vote_time_min = min;
+  ot->vote_time_sec = sec;
+  ot->vote_time_count++;
+
+  if (ot->vote_time_count >= FLEX_VOTE_THRESHOLD) {
+    /* Promote to confirmed */
+    ot->hour = hour;
+    ot->min = min;
+    ot->sec_coarse = sec;
+    ot->has_time = 1;
+    ot->frame_time = cur_abs_frame;
+    verbprintf(3, "FLEX_NEXT: flextime TIME confirmed after %d votes: %02u:%02u:%04.1f\n",
+               FLEX_VOTE_THRESHOLD, hour, min, sec * 7.5);
+    return 1;
+  }
+  return 0;
+}
+
+/* Compute the next calendar day from a given date.
+ * Handles month-end rollover (incl. leap year) and Dec 31 -> Jan 1. */
+static void flextime_next_day(unsigned int y, unsigned int m, unsigned int d,
+                              unsigned int *ny, unsigned int *nm, unsigned int *nd) {
+  static const unsigned int dim[13] = {
+    0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+  };
+  unsigned int max_d = dim[m];
+  if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)))
+    max_d = 29;
+  if (d < max_d) {
+    *ny = y; *nm = m; *nd = d + 1;
+  } else if (m < 12) {
+    *ny = y; *nm = m + 1; *nd = 1;
+  } else {
+    *ny = y + 1; *nm = 1; *nd = 1;
+  }
+}
+
+/* Check if two dates "agree" -- they are the same date, or one is the
+ * next calendar day of the other (handles day/month/year rollover). */
+static int flextime_dates_agree(unsigned int y1, unsigned int m1, unsigned int d1,
+                                unsigned int y2, unsigned int m2, unsigned int d2) {
+  /* Same date */
+  if (y1 == y2 && m1 == m2 && d1 == d2)
+    return 1;
+  /* Check if (y2,m2,d2) is the next day after (y1,m1,d1) */
+  unsigned int ny, nm, nd;
+  flextime_next_day(y1, m1, d1, &ny, &nm, &nd);
+  if (ny == y2 && nm == m2 && nd == d2)
+    return 1;
+  /* Check the reverse: (y1,m1,d1) is the next day after (y2,m2,d2) */
+  flextime_next_day(y2, m2, d2, &ny, &nm, &nd);
+  if (ny == y1 && nm == m1 && nd == d1)
+    return 1;
+  return 0;
+}
+
+/* Vote on a BIW DATE reading using a history ring.
+ * The real date is either static or transitions to the next calendar day
+ * at midnight.  Garbage from corrupted BCH words is random and won't
+ * cluster.  We push every valid calendar date into the ring, then count
+ * how many entries agree with the new reading.  If >= threshold, promote.
+ * Returns 1 if the reading was promoted. */
+static int flextime_vote_date(struct Flex_OTA_Time *ot,
+                              unsigned int year, unsigned int mon, unsigned int day,
+                              unsigned int cur_abs_frame) {
+  /* Step 1: calendar validation */
+  if (!flextime_date_valid(year, mon, day)) {
+    verbprintf(3, "FLEX_NEXT: flextime DATE invalid calendar: %04u-%02u-%02u, discarding\n",
+               year, mon, day);
+    return 0;  /* don't push garbage into the ring */
+  }
+
+  /* Step 2: push into ring (even before counting -- it participates) */
+  ot->date_ring_year[ot->date_ring_idx] = year;
+  ot->date_ring_month[ot->date_ring_idx] = mon;
+  ot->date_ring_day[ot->date_ring_idx] = day;
+  ot->date_ring_idx = (ot->date_ring_idx + 1) % FLEX_VOTE_RING;
+  if (ot->date_ring_count < FLEX_VOTE_RING)
+    ot->date_ring_count++;
+
+  /* Step 3: count how many ring entries agree with this reading */
+  int agree = 0;
+  for (int i = 0; i < ot->date_ring_count; i++) {
+    if (flextime_dates_agree(year, mon, day,
+                             ot->date_ring_year[i], ot->date_ring_month[i], ot->date_ring_day[i]))
+      agree++;
+  }
+
+  if (agree >= FLEX_VOTE_THRESHOLD) {
+    /* Promote the newest value (at a day boundary, prefer the later date) */
+    ot->year = year;
+    ot->month = mon;
+    ot->day = day;
+    ot->has_date = 1;
+    ot->frame_date = cur_abs_frame;
+    verbprintf(3, "FLEX_NEXT: flextime DATE confirmed (%d/%d agree): %04u-%02u-%02u\n",
+               agree, ot->date_ring_count, year, mon, day);
+    return 1;
+  }
+  return 0;
+}
+
+/* Vote on a BIW SYSINFO timezone reading using a history ring.
+ * Zone, DST, and esec must all be identical to agree.  The timezone
+ * doesn't change -- if the ring confirms it, the esec is valid too.
+ *
+ * Before entering the ring, esec (S5-S3) is sanity-checked against the
+ * FIW-derived expected value.  Each sec_ext tick = 7.5s, and the FIW
+ * frame position tells us which 7.5s window we're in:
+ *   expected_ext = ((cycleno * 128 + frameno) % 32) / 4
+ * With +/-1 tolerance this rejects ~62% of random garbage and prevents
+ * corrupted sysinfo words from polluting the ring.
+ *
+ * Returns 1 if the reading was promoted. */
+#define FLEX_ESEC_TOLERANCE 1
+static int flextime_vote_tz(struct Flex_OTA_Time *ot,
+                            unsigned int zone, int dst, unsigned int esec,
+                            int tz_offset_min,
+                            unsigned int cycleno, unsigned int frameno,
+                            unsigned int cur_abs_frame) {
+  /* Gate: sanity-check esec against FIW-derived expected value */
+  {
+    int expected_ext = (int)(((cycleno * 128 + frameno) % 32) / 4);
+    int diff = (int)esec - expected_ext;
+    /* Handle wrap at the minute boundary (esec=7 vs expected=0, or vice versa) */
+    if (diff > 4) diff -= 8;
+    if (diff < -4) diff += 8;
+    if (diff < 0) diff = -diff;
+    if (diff > FLEX_ESEC_TOLERANCE) {
+      verbprintf(3, "FLEX_NEXT: flextime TZ esec FIW sanity failed: esec=%u expected=%d (c=%u f=%u), discarding\n",
+                 esec, expected_ext, cycleno, frameno);
+      return 0;  /* don't pollute the ring */
+    }
+  }
+
+  /* Push into ring */
+  ot->tz_ring_zone[ot->tz_ring_idx] = zone;
+  ot->tz_ring_dst[ot->tz_ring_idx] = dst;
+  ot->tz_ring_esec[ot->tz_ring_idx] = esec;
+  ot->tz_ring_idx = (ot->tz_ring_idx + 1) % FLEX_VOTE_RING;
+  if (ot->tz_ring_count < FLEX_VOTE_RING)
+    ot->tz_ring_count++;
+
+  /* Count how many ring entries are identical (zone + DST + esec) */
+  int agree = 0;
+  for (int i = 0; i < ot->tz_ring_count; i++) {
+    if (ot->tz_ring_zone[i] == zone && ot->tz_ring_dst[i] == dst &&
+        ot->tz_ring_esec[i] == esec)
+      agree++;
+  }
+
+  if (agree >= FLEX_VOTE_THRESHOLD) {
+    ot->tz_zone = zone;
+    ot->tz_offset_min = tz_offset_min;
+    ot->tz_dst = dst;
+    ot->sec_ext = esec;
+    ot->has_tz = 1;
+    ot->frame_tz = cur_abs_frame;
+    verbprintf(3, "FLEX_NEXT: flextime TZ confirmed (%d/%d agree): zone=%u (%+dmin) DST=%d esec=%u\n",
+               agree, ot->tz_ring_count, zone, tz_offset_min, dst, esec);
+    return 1;
+  }
+  return 0;
 }
 
 
@@ -2459,15 +2764,23 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
           unsigned int day = (bword >> 12) & 0x1F;
           unsigned int mon = (bword >> 17) & 0xF;
           unsigned int year = year_raw + 1994;
+          /* The FLEX year field is 5 bits (0-31) with a base of 1994,
+           * giving a native range of 1994-2025.  Starting in 2026 the
+           * field wraps back to 0.  Correct by comparing against the
+           * current system year and advancing by one 32-year epoch
+           * when the decoded year is more than 16 years behind. */
+          {
+            time_t now = time(NULL);
+            struct tm *gmt = gmtime(&now);
+            int cur_year = gmt->tm_year + 1900;
+            while ((int)year + 16 < cur_year)
+              year += 32;
+          }
           verbprintf(2, "FLEX_NEXT: BIW DATE: %04u-%02u-%02u (phase %c)\n", year, mon, day, PhaseNo);
-          // Store as last known good OTA date
           // Validate fields - month 0 or day 0 indicates corrupt data
           if (mon >= 1 && mon <= 12 && day >= 1 && day <= 31) {
-            flex->ota_time.year = year;
-            flex->ota_time.month = mon;
-            flex->ota_time.day = day;
-            flex->ota_time.has_date = 1;
-            flex->ota_time.frame_date = flex->FIW.cycleno * 128 + flex->FIW.frameno;
+            unsigned int abs_frame = flex->FIW.cycleno * 128 + flex->FIW.frameno;
+            flextime_vote_date(&flex->ota_time, year, mon, day, abs_frame);
           } else {
             verbprintf(3, "FLEX_NEXT: BIW DATE out of range: year=%u mon=%u day=%u, discarding\n", year, mon, day);
             break;
@@ -2506,15 +2819,11 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
           unsigned int min = (bword >> 12) & 0x3F;
           unsigned int sec = (bword >> 18) & 0x7;
           verbprintf(2, "FLEX_NEXT: BIW TIME: %02u:%02u:%04.1f (phase %c)\n", hour, min, sec * 7.5, PhaseNo);
-          // Store as last known good OTA time (coarse, 7.5s resolution)
-          // Validate fields before storing - corrupted BCH words can produce
-          // out-of-range values (e.g. hour=24, min=63)
+          // Validate range, then submit to voting with FIW cross-validation
           if (hour <= 23 && min <= 59 && sec <= 7) {
-            flex->ota_time.hour = hour;
-            flex->ota_time.min = min;
-            flex->ota_time.sec_coarse = sec;
-            flex->ota_time.has_time = 1;
-            flex->ota_time.frame_time = flex->FIW.cycleno * 128 + flex->FIW.frameno;
+            unsigned int abs_frame = flex->FIW.cycleno * 128 + flex->FIW.frameno;
+            flextime_vote_time(&flex->ota_time, hour, min, sec,
+                               flex->FIW.cycleno, flex->FIW.frameno, abs_frame);
           } else {
             verbprintf(3, "FLEX_NEXT: BIW TIME out of range: hour=%u min=%u sec=%u, discarding\n", hour, min, sec);
             break;
@@ -2568,13 +2877,12 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
             int tz_min = (zone < 32) ? flex_tz_table[zone] : 0;
             verbprintf(2, "FLEX_NEXT: BIW SYSINFO: timezone zone=%u (%+dmin) DST=%u extsec=%u (phase %c)\n",
                        zone, tz_min, dst, esec, PhaseNo);
-            // Store as last known good OTA timezone
-            flex->ota_time.tz_zone = zone;
-            flex->ota_time.tz_offset_min = tz_min;
-            flex->ota_time.tz_dst = (int)dst;
-            flex->ota_time.sec_ext = esec;
-            flex->ota_time.has_tz = 1;
-            flex->ota_time.frame_tz = flex->FIW.cycleno * 128 + flex->FIW.frameno;
+            // Submit to voting -- requires 3 identical readings
+            {
+              unsigned int abs_frame = flex->FIW.cycleno * 128 + flex->FIW.frameno;
+              flextime_vote_tz(&flex->ota_time, zone, (int)dst, esec, tz_min,
+                              flex->FIW.cycleno, flex->FIW.frameno, abs_frame);
+            }
           } else {
             verbprintf(3, "FLEX_NEXT: BIW SYSINFO: A=%u I=0x%03X (phase %c)\n", a_type, info, PhaseNo);
           }
@@ -2665,7 +2973,7 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
   //
   // Previous approach used 4-bit nibble checksum on vector words to
   // find where "real" vectors end and tone-only addresses begin.
-  // This was too aggressive — the checksum can fail on valid vectors
+  // This was too aggressive -- the checksum can fail on valid vectors
   // after BCH correction or I&D merge substitution, causing false
   // tone-only classification and lost messages.
   //
@@ -2677,7 +2985,7 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
   //   3. The address word itself passes BCH with error count <= 1
   //
   // This ensures we only classify as tone-only when we are certain
-  // the vector slot contains no real data.  Currently disabled —
+  // the vector slot contains no real data.  Currently disabled --
   // all vector slots are treated as valid (matches FLEX behavior).
   // Tone-only pages are extremely rare on real networks (e.g. P2000).
   int n_valid_vecs;
@@ -3829,7 +4137,7 @@ static void flex_sym(struct Flex_Next * flex, unsigned char sym) {
 
         // Correlate against both C and inv.C independently.
         // C is in the first half, inv.C in the second half.
-        // Once C is found, only accept inv.C near c_pos + s2_half (±2).
+        // Once C is found, only accept inv.C near c_pos + s2_half (+/-2).
         // Keep best (lowest error) match within the expected window.
         {
           unsigned int bits_per_sym = (flex->Sync.levels == 4) ? 2 : 1;
@@ -3850,17 +4158,17 @@ static void flex_sym(struct Flex_Next * flex, unsigned char sym) {
             }
 
             // inv.C detection: second half only, and if C was found,
-            // only accept near c_pos + s2_half (±2).
+            // only accept near c_pos + s2_half (+/-2).
             if (cinv_errs <= 2 && flex->State.sync2_count > s2_half) {
               int accept = 0;
               if (flex->State.sync2_c_found) {
-                // C found — expect inv.C at c_pos + s2_half
+                // C found -- expect inv.C at c_pos + s2_half
                 int expected_cinv = flex->State.sync2_c_pos + (int)s2_half;
                 int dist = (int)flex->State.sync2_count - expected_cinv;
                 if (dist >= -2 && dist <= 2)
                   accept = 1;
               } else {
-                // C not found — accept any inv.C in second half
+                // C not found -- accept any inv.C in second half
                 accept = 1;
               }
               if (accept && (!flex->State.sync2_cinv_found || (int)cinv_errs < flex->State.sync2_cinv_errs)) {
@@ -3874,7 +4182,7 @@ static void flex_sym(struct Flex_Next * flex, unsigned char sym) {
           }
         }
 
-        // End of S2 period — decide boundary and transition to DATA.
+        // End of S2 period -- decide boundary and transition to DATA.
         // Check at s2_symbols (nominal) and also handle early boundary.
         {
           int boundary = -1;  // -1 = not decided yet
