@@ -23,45 +23,35 @@
  */
 /*
  *  Modification (to this file) made by Vasyl Samoilov (vasyl.samoilov@gmail.com)
- *   - Per-word bch_err[] tracking; damaged words shown as '?' instead of garbage
+ *   Decoding:
+ *   - Per-word BCH error tracking; damaged words shown as '?' instead of garbage
  *   - Long address decoding: full ARIB STD-43A Table 3.8.2.2-1 (all address sets)
- *   - FIW: roaming, repeat, traffic, num_tx (1-4), td_collapse fields
- *   - BIW parsing: SSID1, Date, Time, SysInfo (timezone/DST/extended seconds), SSID2
- *   - BIW101 system message vector decode at end of VF (Section 3.9.2 method a/b)
- *   - S2 C/inv.C detection with symbol buffer and replay for boundary correction
- *   - Phase mapping: bit_b to PhaseC at 1600 baud (A3), PhaseB at 3200 baud (A4)
  *   - Address type classification: S/L/N/T/O/I/R with special address handling
- *   - Network address payload decode (area/zones/traffic)
- *   - Operator message category logging (SysMsg/SSIDChange/SysEvent)
- *   - Secure message (V=000): t1t0 sub-type dispatch; t=00 as alpha, t=10 as binary
- *   - Short message vector (V=010): sub-type decode (numeric/source/numbered/reserved)
- *   - Tone-only: address-level (no vector) vs all-space short message
- *   - Numeric: K checksum verification, BCD 0xA = '.', tags NUM/SNUM/NNUM
- *   - HEX: nibble extraction, hdr2 parsing, fill stripping, signature (S) validation
- *   - Alpha: K checksum (10-bit) and signature (7-bit) verification
- *   - HEX header: type-dependent bit extraction (12-bit K shifts C/F/N; R/M in hdr2)
- *   - Fragment reassembly: 16 slots, 64-frame timeout, F sequence tracking (mod 3)
- *   - Fragment keying by (capcode, type, msg_n) to separate interleaved messages
- *   - R/M carry-over: initial fragment's R/M propagated to continuation and reassembled
- *   - Frag flags: F.C.flag.Nnn.Rn[.M][.K-][.SIGN-][.DUP][.DUP+]
- *   - Word-level deduplication: 32-slot cache, word-level combining on retransmission
- *   - JSON output (--json): all message types, BIW system info, flextime, fragment info
- *   - flextime: OTA timestamp from BIW date/time/timezone with per-component age tracking
- *   - Timezone lookup table: 32-entry FLEX spec table with fractional offsets
- *   - Extended seconds: S5-S3 from BIW SYSINFO combined with S2-S0 for 0.9375s precision
- *   - flextime expiry: components invalidated after one full cycle (1920 frames + margin)
- *   - JSON fields: msg_type (human-readable), group_slot, instruction_type, sec_subtype,
- *     smsg_sub_type, source_code, blocking, opr_category, biw_position, frag_seq,
- *     frag_index, frag_words, frag_chars, total_fragments, total_chars, frag_seq_error,
- *     precision_seconds, group_capcodes array, flextime object with date/time/tz components
- *   Bug fixes:
- *   - Group message K checksum/signature: removed incorrect len skip for group addresses
- *   - Instruction vector (V=001): moved handler before hdr/len calculation to prevent
- *     "Invalid VIW" false positives when instruction data encodes out-of-range mw1
- *   - Instruction vector pre-scan: bypass nibble checksum for type=1 vectors
- *   - Atomic level-0 output: message line emitted in single verbprintf call to prevent
- *     debug output interleaving at higher verbosity levels
- *   - Group capcodes in capcode field (space-separated) matching FLEX output convention
+ *   - All message types: ALN, NUM/SNUM/NNUM, HEX, SEC:ALN/BIN/VEN/RSV, SMSG, INS
+ *   - K checksum and signature (S) verification for ALN, HEX, numeric types
+ *   - Fragment reassembly with F sequence tracking, R/M carry-over, partial output
+ *   - Word-level deduplication: 32-slot cache, combining on retransmission
+ *   - BIW parsing: SSID1/2, Date, Time, SysInfo (timezone/DST/extended seconds)
+ *   - BIW101 system message vector decode at end of VF (Section 3.9.2)
+ *   - S2 C/inv.C detection with symbol buffer and replay for boundary correction
+ *   Flextime (OTA network time):
+ *   - Year rollover fix: 5-bit year field (base 1994) corrected for 32-year wrap
+ *   - BIW TIME cross-validated against FIW-derived minute (+/-2 min tolerance)
+ *   - BIW TIME: 3 consecutive forward-ticking readings required to confirm
+ *   - BIW DATE: history ring with majority voting, calendar validation
+ *   - BIW SYSINFO TZ: esec FIW sanity gate + history ring (3 identical readings)
+ *   - FLEXTIME event output on confirmation (piped and JSON)
+ *   Piped output format (9 fields, pipe-separated):
+ *   - FLEX_NEXT|timestamp+tz|baud/levels|cycle.frame.phase|capcode|addr|TYPE|flags|message
+ *   - Atomic line output (single verbprintf per line, no interleaving)
+ *   - Timestamp: ISO 8601 local time with timezone offset
+ *   - Consistent 9-field format across all message types
+ *   - Type tags: ALN, NUM, SNUM, NNUM, HEX, SEC:ALN/BIN/VEN/RSV, SMSG, INS, FLEXTIME
+ *   - INS sub-types: K.GRP (group setup), K.EVT (system event), K.RSV (reserved)
+ *   - SMSG sub-types: K.NUM, K.SRC, K.TON, K.NID, K.RSV
+ *   - Flags: frag.index/seq, N, R, M, K+/-, SIG+/-, DUP/DUP+, G<slot>
+ *   - Temp group: slot reuse detection, fragment grace period for reassembly
+ *   - JSON output (--json): all message types, BIW system info, flextime, fragments
  *  Modification (to this file) made by Ryan Farley (rfarley3@github)
  *   - Issue #139 !160 handle edge cases for start and end offsets (long vs short, single vs group)
  *   - Resolve type ambiguity to improve stability after Raspberry Pi compile
@@ -2300,7 +2290,7 @@ static void parse_short_message(struct Flex_Next * flex, unsigned int * phaseptr
       unsigned int multiplier = (phaseptr[j] >> 14) & 0x07;
       unsigned int tmf = (phaseptr[j] >> 17) & 0x0F;
       if (!json_mode) {
-        verbprintf(0, "%s|SMSG|K.NID|area=%u multiplier=%u traffic_flags=0x%X\n", flex->line_prefix, area_id, multiplier, tmf);
+        verbprintf(0, "%s|SMSG|K.NID|service_area=%u multiplier=%u traffic_flags=0x%X\n", flex->line_prefix, area_id, multiplier, tmf);
       } else {
         cJSON *extra = cJSON_CreateObject();
         cJSON_AddStringToObject(extra, "smsg_sub_type", "network_id");
@@ -3716,49 +3706,11 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
     // We log them with their address type and fall through to normal
     // message decode for the body content.
 
-    // Network Address (Section 3.8.2.1): carries Service Area ID,
-    // Coverage Zone Count, and Traffic Management Flags in the first
-    // message word.  Uses Secure (V=000) vector type.
-    if (flex->Decode.addr_type == 'N' &&
-        flex->Decode.type == FLEX_PAGETYPE_SECURE &&
-        mw1 < (unsigned)PHASE_WORDS && !decode_errs[mw1]) {
-      uint32_t net_mw = decode_words[mw1];
-      unsigned int area_id = net_mw & 0x3F;
-      unsigned int zones   = (net_mw >> 6) & 0x1F;
-      unsigned int traffic = (net_mw >> 11) & 0x3FF;
-      if (!json_mode) {
-        verbprintf(0, "%s|NET|K|area=%u zones=%u traffic=0x%03X\n", flex->line_prefix, area_id, zones, traffic);
-      } else {
-        cJSON *json = cJSON_CreateObject();
-        if (json) {
-          time_t now = time(NULL);
-          struct tm *gmt = gmtime(&now);
-          char ts[64];
-          snprintf(ts, sizeof(ts), "%04d-%02d-%02d %02d:%02d:%02d",
-                   gmt->tm_year+1900, gmt->tm_mon+1, gmt->tm_mday,
-                   gmt->tm_hour, gmt->tm_min, gmt->tm_sec);
-          cJSON_AddStringToObject(json, "timestamp", ts);
-          cJSON_AddNumberToObject(json, "baud", flex->Sync.baud);
-          cJSON_AddNumberToObject(json, "level", flex->Sync.levels);
-          char ph[2] = { PhaseNo, '\0' };
-          cJSON_AddStringToObject(json, "phase", ph);
-          cJSON_AddNumberToObject(json, "cycle", flex->FIW.cycleno);
-          cJSON_AddNumberToObject(json, "frame", flex->FIW.frameno);
-          cJSON_AddNumberToObject(json, "capcode", (double)flex->Decode.capcode);
-          char at[2] = { flex->Decode.addr_type, '\0' };
-          cJSON_AddStringToObject(json, "addr_type", at);
-          cJSON_AddStringToObject(json, "msg_type", "secure");
-          cJSON_AddStringToObject(json, "type_tag", "NET");
-          cJSON_AddNumberToObject(json, "area_id", area_id);
-          cJSON_AddNumberToObject(json, "zones", zones);
-          cJSON_AddNumberToObject(json, "traffic", traffic);
-          char *out = cJSON_PrintUnformatted(json);
-          if (out) { fprintf(stdout, "%s\n", out); free(out); }
-          cJSON_Delete(json);
-        }
-      }
-      goto page_done;
-    }
+    // Network Address (Section 3.8.2.1) with Secure (V=000) vector:
+    // NID data is normally carried via Short Message Vector (t=00).
+    // Secure messages on Network Addresses (e.g. NID Change Instruction,
+    // Section 3.9.7) use formats not in the public standard (STD-43A).
+    // No special handling — falls through to normal SEC type dispatch.
 
     // Operator Message Address (Section 3.8.2.5): sub-type in LSB of
     // address word.  Categories: SysMsg (0-3), SSIDChange (0xE),
