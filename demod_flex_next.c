@@ -892,16 +892,28 @@ static void flextime_emit(struct Flex_Next *flex, char phase) {
 }
 
 
-// Identify address type from the raw address word value (before capcode conversion).
-// Returns a single character: S=short, L=long, N=network, T=temporary, O=operator, I=info
+// Classify address type from the raw 21-bit address word (NOT capcode).
+// For special addresses: capcode = aw - 0x8000 (FLEX_SHORT_ADDR_OFFSET).
+// Returns a single character:
+//   S = Short individual   L = Long individual
+//   R = Reserved           I = Info Service (capcode 2,009,088-2,025,471)
+//   N = Network/NID        T = Temporary (group)
+//   O = Operator Message
 static char addr_type_char(uint32_t aiw, int is_long) {
   if (is_long) return 'L';
-  // Special address ranges (Section 3.8.2):
-  if (aiw >= 0x1F0001L && aiw <= 0x1F77FFL) return 'N';  // Network
+  // Special address word ranges per ARIB STD-43A Table 3.8.1-1:
+  //   aw 0x1F0001-0x1F27FF (capcode 1,998,849-2,009,087): Reserved Short 1
+  //   aw 0x1F2800-0x1F67FF (capcode 2,009,088-2,025,471): Info Service
+  //   aw 0x1F6800-0x1F77FF (capcode 2,025,472-2,029,567): Network (NID)
+  //   aw 0x1F7800-0x1F780F (capcode 2,029,568-2,029,583): Temporary (group)
+  //   aw 0x1F7810-0x1F781F (capcode 2,029,584-2,029,599): Operator Message
+  //   aw 0x1F7820-0x1F7FFE (capcode 2,029,600-2,031,614): Reserved Short 2
+  if (aiw >= 0x1F0001L && aiw <= 0x1F27FFL) return 'R';  // Reserved Short 1
+  if (aiw >= 0x1F2800L && aiw <= 0x1F67FFL) return 'I';  // Info Service
+  if (aiw >= 0x1F6800L && aiw <= 0x1F77FFL) return 'N';  // Network (NID)
   if (aiw >= 0x1F7800L && aiw <= 0x1F780FL) return 'T';  // Temporary (group)
   if (aiw >= 0x1F7810L && aiw <= 0x1F781FL) return 'O';  // Operator Message
-  if (aiw >= 0x1F7820L && aiw <= 0x1F7FEFL) return 'I';  // Info Service
-  if (aiw >= 0x1F7FF0L && aiw <= 0x1F7FFEL) return 'R';  // Reserved
+  if (aiw >= 0x1F7820L && aiw <= 0x1F7FFEL) return 'R';  // Reserved Short 2
   return 'S';  // Normal short address
 }
 
@@ -3222,17 +3234,21 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
     /*********************
      * Parse AW
      *
-     * Address word classification per ARIB STD-43A Table 3.8.2-1:
-     *   Short address (SA):  0x8001 - 0x1E0000  (capcode = aw - 0x8000)
+     * Address word classification per ARIB STD-43A Table 3.8.1-1.
+     * All values are raw 21-bit address words (NOT capcodes).
+     * For short/special: capcode = aw - 0x8000.
+     *
+     *   Short address (SA):   0x008001 - 0x1E0000  (capcode 1-1,933,312)
      *   Long Address 1 (LA1): 0x000001 - 0x008000
      *   Long Address 2 (LA2): 0x1F7FFF - 0x1FFFFE
      *   Long Address 3 (LA3): 0x1E0001 - 0x1E8000
      *   Long Address 4 (LA4): 0x1E8001 - 0x1F0000
-     *   Temporary Address:    0x1F7800 - 0x1F780F (16 group slots)
-     *   Network Address:      0x1F0001 - 0x1F7799 (system info)
-     *   Operator Msg Address: 0x1F7810 - 0x1F781F
-     *   Info Service Address: 0x1F7820 - 0x1F7FEF
-     *   Reserved:             0x1F7FF0 - 0x1F7FFE
+     *   Reserved Short 1:     0x1F0001 - 0x1F27FF  (capcode 1,998,849-2,009,087)
+     *   Info Service:         0x1F2800 - 0x1F67FF  (capcode 2,009,088-2,025,471)
+     *   Network (NID):        0x1F6800 - 0x1F77FF  (capcode 2,025,472-2,029,567)
+     *   Temporary Address:    0x1F7800 - 0x1F780F  (capcode 2,029,568-2,029,583)
+     *   Operator Msg Address: 0x1F7810 - 0x1F781F  (capcode 2,029,584-2,029,599)
+     *   Reserved Short 2:     0x1F7820 - 0x1F7FFE  (capcode 2,029,600-2,031,614)
      *
      * Long addresses use 2 consecutive address words.
      * The first word determines the type (LA1 or LA2).
@@ -3240,17 +3256,18 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
      */
     uint32_t aiw = phaseptr[i];
 
-    // Classify address word type
+    // Classify address word type (all values are raw 21-bit address words):
     // LA1: 0x000001 - 0x008000 (first word of long address sets 1-2, 1-3, 1-4)
-    // SA:  0x008001 - 0x1E0000 (short address, capcode = aw - 0x8000, range 1-1933312)
+    // SA:  0x008001 - 0x1E0000 (short address, capcode = aw - 0x8000, range 1-1,933,312)
     // LA3: 0x1E0001 - 0x1E8000 (second word only, never first)
     // LA4: 0x1E8001 - 0x1F0000 (second word only, never first)
-    // Special addresses (short, capcode = aw - 0x8000):
-    //   Network:  0x1F0001 - 0x1F77FF
-    //   Temporary: 0x1F7800 - 0x1F780F (16 group slots)
-    //   Operator:  0x1F7810 - 0x1F781F
-    //   Info Svc:  0x1F7820 - 0x1F7FEF
-    //   Reserved:  0x1F7FF0 - 0x1F7FFE
+    // Special addresses (capcode = aw - 0x8000):
+    //   Rsvd Short 1: 0x1F0001 - 0x1F27FF (capcode 1,998,849-2,009,087)
+    //   Info Service: 0x1F2800 - 0x1F67FF (capcode 2,009,088-2,025,471)
+    //   Network:      0x1F6800 - 0x1F77FF (capcode 2,025,472-2,029,567)
+    //   Temporary:    0x1F7800 - 0x1F780F (capcode 2,029,568-2,029,583)
+    //   Operator:     0x1F7810 - 0x1F781F (capcode 2,029,584-2,029,599)
+    //   Rsvd Short 2: 0x1F7820 - 0x1F7FFE (capcode 2,029,600-2,031,614)
     // LA2: 0x1F7FFF - 0x1FFFFE (first word of long address sets 2-3, 2-4)
     flex->Decode.long_address = (aiw >= 0x000001L && aiw <= 0x008000L) ||  // LA1
                                 (aiw >= 0x1F7FFFL && aiw <= 0x1FFFFEL);    // LA2
@@ -3795,7 +3812,7 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
     // NID data is normally carried via Short Message Vector (t=00).
     // Secure messages on Network Addresses (e.g. NID Change Instruction,
     // Section 3.9.7) use formats not in the public standard (STD-43A).
-    // No special handling — falls through to normal SEC type dispatch.
+    // No special handling -- falls through to normal SEC type dispatch.
 
     // Operator Message Address (Section 3.8.2.5): sub-type in LSB of
     // address word.  Categories: SysMsg (0-3), SSIDChange (0xE),
@@ -3817,7 +3834,7 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
     }
 
     // Info Service Address (Section 3.8.2, maildrop):
-    // No special handling — decoded by normal type dispatch below.
+    // No special handling -- decoded by normal type dispatch below.
     // Address type 'I' distinguishes it from regular messages.
 
     // Reserved Short Address: log and skip (no defined behavior).
