@@ -2856,10 +2856,13 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
   }
 
   // Multiple transmission (Section 3.4.2):
-  // Subframe splitting ignored - always decode full 88-word frame.
+  // When num_tx > 1, frame is split into subframes for retransmission.
+  // We always decode the full 88-word frame regardless.
   int num_tx = (int)flex->FIW.num_tx;
-  int sf_size = (num_tx == 2) ? 44 : (num_tx == 3) ? 29 : (num_tx == 4) ? 22 : 88;
-  verbprintf(num_tx > 1 ? 0 : 3, "FLEX_NEXT: num_tx=%d sf_size=%d, decoding full frame (subframe retransmission ignored)\n", num_tx, sf_size);
+  if (num_tx > 1) {
+    int sf_size = (num_tx == 2) ? 44 : (num_tx == 3) ? 29 : (num_tx == 4) ? 22 : 88;
+    verbprintf(0, "FLEX_NEXT: num_tx=%d sf_size=%d, decoding full frame (subframe retransmission ignored)\n", num_tx, sf_size);
+  }
 
   // Block information word is the first data word
   flex->biw_sysmsg_a_type = -1;
