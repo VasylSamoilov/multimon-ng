@@ -3809,7 +3809,7 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
       // Fall through to normal message decode for body content
     }
 
-    // Info Service Address (Section 3.8.2, under study):
+    // Info Service Address (Section 3.8.2, maildrop):
     // No special handling — decoded by normal type dispatch below.
     // Address type 'I' distinguishes it from regular messages.
 
