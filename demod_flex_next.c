@@ -1117,7 +1117,6 @@ static unsigned int count_bits(struct Flex_Next * flex, unsigned int data) {
 }
 
 
-
 static int bch3121_fix_errors(struct Flex_Next * flex, uint32_t * data_to_fix, char PhaseNo) {
   if (flex==NULL) return -1;
 
@@ -4552,13 +4551,8 @@ static int buildSymbol(struct Flex_Next * flex, double sample) {
                         else
                                 flex->Demodulator.symcount[1]++;
                 }
-                /* Integrate-and-dump: use tighter window that excludes
-                 * inter-symbol transitions.  Transition duration is
-                 * ~sample_rate/(2*baud) samples per side, which is
-                 * 50*baud/sample_rate percent of the symbol period.
-                 * At 3200 baud/22050 Hz: ~7.3% per side -> 25%-75% window.
-                 * At 1600 baud/22050 Hz: ~3.6% per side -> 14%-86% window.
-                 * Use 25% margin to be safe. */
+                /* Integrate-and-dump: use center 50% of symbol period.
+                 * Excludes inter-symbol transitions for cleaner mean. */
                 if (phasepercent > 25 && phasepercent < 75) {
                         flex->Demodulator.sym_sum += sample;
                         flex->Demodulator.sym_n++;
@@ -4635,7 +4629,10 @@ static void Flex_Demodulate(struct Flex_Next * flex, double sample) {
     flex->Demodulator.symcount[2] = 0;
     flex->Demodulator.symcount[3] = 0;
 
-    /* ALTERNATE: Integrate-and-dump symbol decision */
+    /* ALTERNATE: Integrate-and-dump symbol decision.
+     * Uses the mean of samples in the same window as majority vote.
+     * For 4FSK, the mean provides better inner-level discrimination
+     * than per-sample voting. */
     int alt_symbol = 1;
     if (flex->Demodulator.sym_n > 0) {
       double mean = flex->Demodulator.sym_sum / flex->Demodulator.sym_n;
@@ -4654,8 +4651,17 @@ static void Flex_Demodulate(struct Flex_Next * flex, double sample) {
       int alt_bit_a = (alt_symbol > 1);
       int alt_bit_b = (alt_symbol == 1) || (alt_symbol == 2);
       unsigned int idx = ((flex->Data.data_bit_counter>>5)&0xFFF8) | (flex->Data.data_bit_counter&0x0007);
+
+      /* At 1600 baud, phase_toggle is always 0 (no phase alternation).
+       * read_data() forces this at the top of each call, but the alt
+       * slicer runs BEFORE read_data, so it sees the stale toggle=1
+       * left from the previous symbol.  Mirror the same reset here. */
+      int alt_toggle = flex->Data.phase_toggle;
+      if (flex->Sync.baud == 1600)
+        alt_toggle = 0;
+
       if (idx < PHASE_WORDS) {
-        if (flex->Data.phase_toggle == 0) {
+        if (alt_toggle == 0) {
           /* At 1600 baud: every symbol. At 3200 baud: even symbols. */
           flex->Data.AltA.buf[idx] = (flex->Data.AltA.buf[idx]>>1) | (alt_bit_a?(0x80000000):0);
           if (flex->Sync.baud == 1600) {
