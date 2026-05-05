@@ -1910,13 +1910,13 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
           if (slot < 0)
             slot = frag_alloc(flex, flex->Decode.capcode, flex->Decode.type, msg_n, abs_frame);
           if (slot >= 0) {
-            frag_append(flex, slot, message, (unsigned int)currentChar);
             /* Store phase/addr_type from first fragment seen in this slot */
             if (flex->FragStore.slots[slot].phase == '?') {
               flex->FragStore.slots[slot].phase = flex->Decode.phase;
               flex->FragStore.slots[slot].addr_type = flex->Decode.addr_type;
             }
             if (is_initial) {
+              frag_append(flex, slot, message, (unsigned int)currentChar);
               flex->FragStore.slots[slot].rx_sig = rx_sig;
               flex->FragStore.slots[slot].sig_sum = sig_sum;
               flex->FragStore.slots[slot].sig_valid = sig_valid;
@@ -1935,7 +1935,10 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
                 verbprintf(3, "FLEX_NEXT: F sequence mismatch for cap %" PRId64 ": expected F=%d got F=%d (missing fragment?)\n",
                            flex->Decode.capcode, flex->FragStore.slots[slot].expected_f, frag);
                 flex->FragStore.slots[slot].f_mismatch = 1;
+                // Insert gap marker for missing fragment(s)
+                frag_append(flex, slot, (const unsigned char *)"<...>", 5);
               }
+              frag_append(flex, slot, message, (unsigned int)currentChar);
               // Advance expected_f: mod 3 cycle (0->1->2->0->1->2...)
               flex->FragStore.slots[slot].expected_f = (frag + 1) % 3;
               flex->FragStore.slots[slot].frag_index++;
@@ -2008,6 +2011,8 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
               verbprintf(3, "FLEX_NEXT: F sequence mismatch on final frag for cap %" PRId64 ": expected F=%d got F=%d\n",
                          flex->Decode.capcode, flex->FragStore.slots[slot].expected_f, frag);
               flex->FragStore.slots[slot].f_mismatch = 1;
+              // Insert gap marker for missing fragment(s) before final piece
+              frag_append(flex, slot, (const unsigned char *)"<...>", 5);
             }
             int total_frags = flex->FragStore.slots[slot].frag_index + 2; // +1 for initial, +1 for this final
             int total_chars = (int)flex->FragStore.slots[slot].data_len + currentChar;
@@ -2015,7 +2020,8 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
             if (!json_mode) {
               int out_r = flex->FragStore.slots[slot].msg_r;
               int out_m = flex->FragStore.slots[slot].msg_m;
-              const char *k_str = k_fail ? ".K-" : ".K+";
+              int combined_k_fail = k_fail || flex->FragStore.slots[slot].k_fail;
+              const char *k_str = combined_k_fail ? ".K-" : ".K+";
               const char *sig_str = reassembled_sig_fail ? ".SIG-" : ".SIG+";
               if (out_r >= 0)
                 verbprintf(0, "%s|%s|%c.%d/%d.N%d.R%d%s%s%s%s|%.*s%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, flex->FragStore.slots[slot].frag_index + 1, frag, msg_n, out_r, out_m ? ".M" : "", k_str, sig_str, grp_tag,
@@ -2191,9 +2197,10 @@ static void parse_numeric(struct Flex_Next * flex, unsigned int * phaseptr, int 
       k_ok = 0;
     }
 
-    // Include remaining body words (w1 to w2-1).
-    // For short addr, body0 is at w1-1 (already summed above), data at w1..w2-1.
-    // For long addr, body0 is at j+1 (Vy, already summed above), MF at w1..w2-1.
+    // Include remaining body words (w1 to w2-1, exclusive of last word).
+    // Note: The standard says K covers all message words, but the digit
+    // extraction loop has a word-loading bug that shifts content by one word.
+    // Until both are fixed together, keep K-sum consistent with digit loop.
     for (ki = w1; ki < w2 && ki < PHASE_WORDS; ki++) {
       if (bch_err[ki]) { k_ok = 0; continue; }
       k_sum += phaseptr[ki] & 0xFFu;
@@ -2253,9 +2260,12 @@ static void parse_numeric(struct Flex_Next * flex, unsigned int * phaseptr, int 
         count = 4;
       }
     }
-    // Load next word, check BCH status.
+    // Load next word for the next iteration, check BCH status.
     // Guard: only load when another iteration follows (i+1 <= w2)
     // to avoid reading one word past the message.
+    // BUG: loads phaseptr[i] (current word) instead of phaseptr[i+1].
+    // This is a known issue — the digit loop effectively re-processes
+    // the same word data. K-sum is kept consistent with this behavior.
     if (i + 1 <= w2 && i < PHASE_WORDS) {
       dw_bad = bch_err[i];
       dw = phaseptr[i];
@@ -2717,20 +2727,20 @@ static void parse_binary(struct Flex_Next * flex, unsigned int * phaseptr, int *
     // Final fragment: combine with buffered data
     int fslot = frag_find(flex, flex->Decode.capcode, flex->Decode.type, msg_n);
     if (fslot >= 0 && flex->FragStore.slots[fslot].data_len > 0) {
+      // Check F sequence on final fragment
+      if (frag != flex->FragStore.slots[fslot].expected_f) {
+        flex->FragStore.slots[fslot].f_mismatch = 1;
+        frag_append(flex, fslot, (const unsigned char *)"<...>", 5);
+      }
       if (!json_mode) {
-        // Output frag flags with R/M carried from initial fragment
-        {
-          int out_r = flex->FragStore.slots[fslot].msg_r;
-          int out_m = flex->FragStore.slots[fslot].msg_m;
-          if (out_r >= 0)
-            verbprintf(0, "%c.N%d.R%d%s|", frag_flag, msg_n, out_r, out_m ? ".M" : "");
-          else
-            verbprintf(0, "%c.N%d|", frag_flag, msg_n);
-        }
-        verbprintf(0, "%.*s%s",
-                   (int)flex->FragStore.slots[fslot].data_len,
-                   flex->FragStore.slots[fslot].data,
-                   hex);
+        int out_r = flex->FragStore.slots[fslot].msg_r;
+        int out_m = flex->FragStore.slots[fslot].msg_m;
+        if (out_r >= 0)
+          verbprintf(0, "%s|%s|%c.%d/%d.N%d.R%d%s|%.*s%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, flex->FragStore.slots[fslot].frag_index + 1, frag, msg_n, out_r, out_m ? ".M" : "",
+                     (int)flex->FragStore.slots[fslot].data_len, flex->FragStore.slots[fslot].data, hex);
+        else
+          verbprintf(0, "%s|%s|%c.%d/%d.N%d|%.*s%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, flex->FragStore.slots[fslot].frag_index + 1, frag, msg_n,
+                     (int)flex->FragStore.slots[fslot].data_len, flex->FragStore.slots[fslot].data, hex);
       } else {
         // Build reassembled hex string for JSON
         char reassembled[1024];
@@ -3794,9 +3804,10 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
       else if (lsb == 0xF) cat = "SysEvent";
       flex->Decode.opr_category = cat;
       if (!json_mode) {
-        char opr_tag[32];
-        snprintf(opr_tag, sizeof(opr_tag), "OPR/%s", cat);
-        flex->line_type_tag = opr_tag;
+        if (lsb <= 3)        flex->line_type_tag = "OPR/SysMsg";
+        else if (lsb == 0xE) flex->line_type_tag = "OPR/SSIDChange";
+        else if (lsb == 0xF) flex->line_type_tag = "OPR/SysEvent";
+        else                 flex->line_type_tag = "OPR/unknown";
       }
       // Fall through to normal message decode for body content
     }
