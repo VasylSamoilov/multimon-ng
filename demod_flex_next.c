@@ -2197,10 +2197,8 @@ static void parse_numeric(struct Flex_Next * flex, unsigned int * phaseptr, int 
       k_ok = 0;
     }
 
-    // Include remaining body words (w1 to w2-1, exclusive of last word).
-    // Note: The standard says K covers all message words, but the digit
-    // extraction loop has a word-loading bug that shifts content by one word.
-    // Until both are fixed together, keep K-sum consistent with digit loop.
+    // Include remaining body words w1..w2-1 (w2 was incremented with w1,
+    // so ki < w2 covers all message words after body0).
     for (ki = w1; ki < w2 && ki < PHASE_WORDS; ki++) {
       if (bch_err[ki]) { k_ok = 0; continue; }
       k_sum += phaseptr[ki] & 0xFFu;
@@ -2263,9 +2261,8 @@ static void parse_numeric(struct Flex_Next * flex, unsigned int * phaseptr, int 
     // Load next word for the next iteration, check BCH status.
     // Guard: only load when another iteration follows (i+1 <= w2)
     // to avoid reading one word past the message.
-    // BUG: loads phaseptr[i] (current word) instead of phaseptr[i+1].
-    // This is a known issue — the digit loop effectively re-processes
-    // the same word data. K-sum is kept consistent with this behavior.
+    // Note: phaseptr[i] is correct here because w1 was incremented
+    // after pre-loading the first body word into dw.
     if (i + 1 <= w2 && i < PHASE_WORDS) {
       dw_bad = bch_err[i];
       dw = phaseptr[i];
