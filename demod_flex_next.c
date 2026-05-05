@@ -943,6 +943,8 @@ static void flex_next_json_emit(struct Flex_Next *flex, char phase,
     cJSON_AddStringToObject(json, "addr_type", at);
   }
   cJSON_AddBoolToObject(json, "is_group", is_group ? 1 : 0);
+  if (flex->Decode.is_priority)
+    cJSON_AddBoolToObject(json, "is_priority", 1);
   if (msg_type >= 0) {
     // Human-readable message type name
     const char *mt_name = "unknown";
@@ -2088,7 +2090,8 @@ static void parse_alphanumeric(struct Flex_Next * flex, unsigned int * phaseptr,
           const char *dup_str = (dedup_flag == 2) ? ".DUP+" : (dedup_flag == 1) ? ".DUP" : "";
           const char *k_str = k_fail ? ".K-" : ".K+";
           const char *sig_str = sig_fail ? ".SIG-" : ".SIG+";
-          verbprintf(0, "%s|%s|%c.0/%d.N%d.R%d%s%s%s%s%s|%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, frag, msg_n, msg_r, msg_m ? ".M" : "", k_str, sig_str, dup_str, grp_tag, message);
+          const char *prio_str = flex->Decode.is_priority ? ".P" : "";
+          verbprintf(0, "%s|%s|%c.0/%d.N%d.R%d%s%s%s%s%s%s|%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, frag, msg_n, msg_r, msg_m ? ".M" : "", prio_str, k_str, sig_str, dup_str, grp_tag, message);
         } else {
           flex_next_json_emit(flex, flex->Decode.phase, flex->Decode.capcode,
                               flex->Decode.addr_type, flex_groupmessage, flex->Decode.type,
@@ -2272,8 +2275,9 @@ static void parse_numeric(struct Flex_Next * flex, unsigned int * phaseptr, int 
   if (!json_mode) {
     const char *dup_str = (dedup_flag == 2) ? ".DUP+" : (dedup_flag == 1) ? ".DUP" : "";
     const char *k_str = num_k_fail ? ".K-" : ".K+";
+    const char *prio_str = flex->Decode.is_priority ? ".P" : "";
     num_msg[num_pos] = '\0';
-    verbprintf(0, "%s|%s|K.0/3.N%d.R%d%s%s%s|%s\n", flex->line_prefix, flex->line_type_tag, msg_n, msg_r, msg_m ? ".M" : "", k_str, dup_str, num_msg);
+    verbprintf(0, "%s|%s|K.0/3.N%d.R%d%s%s%s%s|%s\n", flex->line_prefix, flex->line_type_tag, msg_n, msg_r, msg_m ? ".M" : "", prio_str, k_str, dup_str, num_msg);
   }
 
   if (json_mode) {
@@ -2775,14 +2779,15 @@ static void parse_binary(struct Flex_Next * flex, unsigned int * phaseptr, int *
   if (!json_mode) {
     const char *dup_str = (dedup_flag == 2) ? ".DUP+" : (dedup_flag == 1) ? ".DUP" : "";
     const char *sig_str = hex_sig_fail ? ".SIG-" : ".SIG+";
+    const char *prio_str = flex->Decode.is_priority ? ".P" : "";
     if (is_initial_hex) {
       int blk = hex_blocking ? hex_blocking : 16;
       const char *dir = hex_display_rtl ? "RTL" : "LTR";
       const char *hdr = hex_header_msg ? ".HDR" : "";
       const char *sti = hex_status_info ? ".STI" : "";
-      verbprintf(0, "%s|%s|%c.0/%d.N%d.R%d%s%s.B=%d.%s%s%s%s|%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, frag, msg_n, msg_r, msg_m ? ".M" : "", sig_str, blk, dir, hdr, sti, dup_str, hex);
+      verbprintf(0, "%s|%s|%c.0/%d.N%d.R%d%s%s%s.B=%d.%s%s%s%s|%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, frag, msg_n, msg_r, msg_m ? ".M" : "", prio_str, sig_str, blk, dir, hdr, sti, dup_str, hex);
     } else
-      verbprintf(0, "%s|%s|%c.0/%d.N%d%s%s|%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, frag, msg_n, sig_str, dup_str, hex);
+      verbprintf(0, "%s|%s|%c.0/%d.N%d%s%s%s|%s\n", flex->line_prefix, flex->line_type_tag, frag_flag, frag, msg_n, prio_str, sig_str, dup_str, hex);
   } else {
     cJSON *extra = NULL;
     if (is_initial_hex) {
@@ -3311,6 +3316,8 @@ static void decode_phase(struct Flex_Next * flex, char PhaseNo) {
     flex_groupbit = 0;
     flex->Decode.sec_subtype = NULL;   // reset per page to prevent leaking between messages
     flex->Decode.opr_category = NULL;
+    // Priority: first 'prio' address words in the AF are priority (Section 3.7, 3.8.1(6))
+    flex->Decode.is_priority = ((i - aoffset) < prio) ? 1 : 0;
           // Temporary Address range per Section 3.8.2.3:
           // aw = 0x1F7800 - 0x1F780F (16 group delivery slots)
           // capcode = aw - 0x8000 = 2029568 - 2029583
