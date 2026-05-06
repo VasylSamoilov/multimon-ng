@@ -470,6 +470,21 @@ struct Flex_OTA_Time {
   unsigned int tz_ring_zone[FLEX_VOTE_RING];
   int          tz_ring_dst[FLEX_VOTE_RING];
   unsigned int tz_ring_esec[FLEX_VOTE_RING];   // stored for promotion
+
+  /* --- Time mode detection (standard vs direct) ---
+   * Standard: BIW TIME is constant for all frames in a cycle.
+   * Direct: second field changes every 4 frames.
+   * Heuristic: compare TIME across frames >= 5 apart in same cycle.
+   * Same -> standard vote.  Different -> direct vote.
+   * Anchor only updates after conclusive comparison or new cycle. */
+  int          tmode_detected;                 // 0=standard (default), 1=direct
+  int          tmode_votes_std;
+  int          tmode_votes_dir;
+  unsigned int tmode_anchor_min;
+  unsigned int tmode_anchor_sec;
+  unsigned int tmode_anchor_frame;
+  unsigned int tmode_anchor_cycle;
+  int          tmode_anchor_valid;
 };
 
 /* Frame space: 15 cycles x 128 frames = 1920 frames per full hour cycle.
@@ -579,14 +594,16 @@ static void flex_local_timestamp(char *buf, size_t bufsz) {
 
 static int flextime_fiw_validate(unsigned int biw_min,
                                  unsigned int cycleno, unsigned int frameno) {
-  int fiw_seconds = (int)(cycleno * 240 + frameno * 240 / 128);
-  int fiw_min = fiw_seconds / 60;  /* 0-59 within the hour */
-  int diff = (int)biw_min - fiw_min;
-  /* Handle wrap at the hour boundary (e.g. BIW=59, FIW=1 or vice versa) */
-  if (diff > 30) diff -= 60;
+  (void)frameno;
+  /* Accept BIW minute within the cycle's 4-minute span [cycle*4..cycle*4+3]
+   * mod 60.  This covers both standard (Frame 0 time) and direct (current
+   * frame time) conventions. */
+  int base_min = (int)(cycleno * 4) % 60;
+  int bmin = (int)biw_min;
+  int diff = bmin - base_min;
   if (diff < -30) diff += 60;
-  if (diff < 0) diff = -diff;
-  return diff <= FLEX_TIME_CROSS_TOLERANCE;
+  if (diff > 30) diff -= 60;
+  return diff >= 0 && diff <= 3;
 }
 
 /* Vote on a BIW TIME reading.  Processing order:
@@ -642,6 +659,46 @@ static int flextime_vote_time(struct Flex_OTA_Time *ot,
   ot->vote_time_min = min;
   ot->vote_time_sec = sec;
   ot->vote_time_count++;
+
+  /* Step 4: time mode detection (standard vs direct).
+   * Compare with anchor from same cycle, >= 5 frames apart.
+   * In direct mode, second field changes every 4 frames, so
+   * frames >= 5 apart in different coarse groups MUST differ.
+   * In standard mode, TIME is constant for the entire cycle. */
+  if (ot->tmode_anchor_valid && ot->tmode_anchor_cycle == cycleno) {
+    int fdiff = (int)frameno - (int)ot->tmode_anchor_frame;
+    if (fdiff < 0) fdiff = -fdiff;
+    if (fdiff >= 5) {
+      int same = (min == ot->tmode_anchor_min &&
+                  sec == ot->tmode_anchor_sec);
+      if (same) {
+        ot->tmode_votes_std++;
+        ot->tmode_votes_dir = 0;
+      } else {
+        ot->tmode_votes_dir++;
+        ot->tmode_votes_std = 0;
+      }
+      if (ot->tmode_votes_std >= 3 && ot->tmode_detected != 0) {
+        ot->tmode_detected = 0;
+        verbprintf(1, "FLEX_NEXT: flextime mode detected: STANDARD (Frame 0 time)\n");
+      }
+      if (ot->tmode_votes_dir >= 3 && ot->tmode_detected != 1) {
+        ot->tmode_detected = 1;
+        verbprintf(1, "FLEX_NEXT: flextime mode detected: DIRECT (current frame time)\n");
+      }
+      /* Update anchor after comparison */
+      ot->tmode_anchor_min = min;
+      ot->tmode_anchor_sec = sec;
+      ot->tmode_anchor_frame = frameno;
+    }
+  } else {
+    /* New cycle or first observation: set anchor */
+    ot->tmode_anchor_min = min;
+    ot->tmode_anchor_sec = sec;
+    ot->tmode_anchor_frame = frameno;
+    ot->tmode_anchor_cycle = cycleno;
+    ot->tmode_anchor_valid = 1;
+  }
 
   if (ot->vote_time_count >= FLEX_VOTE_THRESHOLD) {
     /* Promote to confirmed */
@@ -845,8 +902,9 @@ static void flextime_emit(struct Flex_Next *flex, char phase) {
                    ot->has_time ? '+' : '-',
                    ot->has_tz ? '+' : '-');
   if (ot->has_time)
-    fpos += snprintf(flags + fpos, sizeof(flags) - fpos, ".P%s",
-                     ot->has_tz ? "09" : "75");
+    fpos += snprintf(flags + fpos, sizeof(flags) - fpos, ".P%s.%s",
+                     ot->has_tz ? "09" : "75",
+                     ot->tmode_detected == 0 ? "STD" : "DIR");
 
   /* Build OTA timestamp value */
   char ota[80];
@@ -857,16 +915,22 @@ static void flextime_emit(struct Flex_Next *flex, char phase) {
                     ot->year, ot->month, ot->day);
   }
   if (ot->has_time) {
-    double sec;
-    if (ot->has_tz) {
-      unsigned int combined = (ot->sec_ext << 3) | ot->sec_coarse;
-      sec = combined * 0.9375;
-    } else {
-      sec = ot->sec_coarse * 7.5;
-    }
+    /* Compute seconds: coarse*7.5 + ext*0.9375 (ext adds to coarse).
+     * In standard mode, also add frame*1.875s offset. */
+    double base_sec = (double)ot->min * 60.0 + (double)ot->sec_coarse * 7.5;
+    if (ot->has_tz)
+      base_sec += (double)ot->sec_ext * 0.9375;
+    if (ot->tmode_detected == 0)
+      base_sec += (double)flex->FIW.frameno * 1.875;
+
+    unsigned int out_hour = ot->hour;
+    unsigned int out_min = (unsigned int)(base_sec / 60.0);
+    double out_sec = base_sec - (double)out_min * 60.0;
+    if (out_min >= 60) { out_min -= 60; out_hour = (out_hour + 1) % 24; }
+
     if (pos > 0) ota[pos++] = ' ';
     pos += snprintf(ota + pos, sizeof(ota) - pos, "%02u:%02u:%05.2f",
-                    ot->hour, ot->min, sec);
+                    out_hour, out_min, out_sec);
   }
   if (ot->has_tz) {
     int off = ot->tz_offset_min;
@@ -1025,17 +1089,23 @@ static void flex_next_json_emit(struct Flex_Next *flex, char phase,
 
     // Combined timestamp string (only when date+time both available)
     if (flex->ota_time.has_date && flex->ota_time.has_time) {
-      double precise_sec;
-      if (flex->ota_time.has_tz) {
-        unsigned int combined = (flex->ota_time.sec_ext << 3) | flex->ota_time.sec_coarse;
-        precise_sec = combined * 0.9375;
-      } else {
-        precise_sec = flex->ota_time.sec_coarse * 7.5;
-      }
+      /* Compute corrected seconds: coarse*7.5 + ext*0.9375.
+       * In standard mode, add frame*1.875s offset. */
+      double base_sec = (double)flex->ota_time.min * 60.0 +
+                        (double)flex->ota_time.sec_coarse * 7.5;
+      if (flex->ota_time.has_tz)
+        base_sec += (double)flex->ota_time.sec_ext * 0.9375;
+      if (flex->ota_time.tmode_detected == 0)
+        base_sec += (double)flex->FIW.frameno * 1.875;
+      unsigned int j_hour = flex->ota_time.hour;
+      unsigned int j_min = (unsigned int)(base_sec / 60.0);
+      double j_sec = base_sec - (double)j_min * 60.0;
+      if (j_min >= 60) { j_min -= 60; j_hour = (j_hour + 1) % 24; }
+
       char ota_ts[80];
       int ota_pos = snprintf(ota_ts, sizeof(ota_ts), "%04u-%02u-%02u %02u:%02u:%05.2f",
                              flex->ota_time.year, flex->ota_time.month, flex->ota_time.day,
-                             flex->ota_time.hour, flex->ota_time.min, precise_sec);
+                             j_hour, j_min, j_sec);
       if (flex->ota_time.has_tz) {
         int off = flex->ota_time.tz_offset_min;
         const char *dst_str = flex->ota_time.tz_dst ? "" : " DST";
@@ -1092,8 +1162,9 @@ static void flex_next_json_emit(struct Flex_Next *flex, char phase,
       cJSON_AddNumberToObject(tz, "sec_ext", flex->ota_time.sec_ext);
       // sec_combined: precise seconds when both time and tz available
       if (flex->ota_time.has_time) {
-        unsigned int combined = (flex->ota_time.sec_ext << 3) | flex->ota_time.sec_coarse;
-        cJSON_AddNumberToObject(tz, "sec_combined", combined * 0.9375);
+        double sec_combined = (double)flex->ota_time.sec_coarse * 7.5 +
+                              (double)flex->ota_time.sec_ext * 0.9375;
+        cJSON_AddNumberToObject(tz, "sec_combined", sec_combined);
       }
       int af = (int)flextime_age_frames(cur_frame, flex->ota_time.frame_tz);
       cJSON_AddNumberToObject(tz, "age_frames", af);
@@ -1101,6 +1172,8 @@ static void flex_next_json_emit(struct Flex_Next *flex, char phase,
       cJSON_AddItemToObject(ft, "tz", tz);
     }
 
+    cJSON_AddStringToObject(ft, "time_mode",
+                            flex->ota_time.tmode_detected == 0 ? "standard" : "direct");
     cJSON_AddItemToObject(json, "flextime", ft);
     } // end re-check after expiry
   }
